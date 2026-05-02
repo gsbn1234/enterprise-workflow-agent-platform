@@ -1,0 +1,5 @@
+{"id":"refund_high_amount","objective":"客户 Orbit Retail 投诉上月服务中断，要求退费 800 元，请创建工单并准备回复 support@orbit.example","expected_category":"refund","expected_approval":true,"expected_tools":["lookup_customer","search_knowledge","create_ticket","draft_email","request_approval"]}
+{"id":"security_access","objective":"发现 Acme China 账号疑似异常登录并可能存在权限泄露，请通知安全团队并保留审计，不要直接删除数据","expected_category":"security","expected_approval":true,"expected_tools":["lookup_customer","search_knowledge","create_ticket","request_approval"]}
+{"id":"procurement_low","objective":"运营团队想购买一个 300 元的数据清洗插件，请登记采购需求并给出处理建议","expected_category":"procurement","expected_approval":false,"expected_tools":["search_knowledge","create_ticket"]}
+{"id":"incident_p1","objective":"P1 故障：Acme China 反馈控制台无法访问，请创建故障工单并整理响应依据","expected_category":"incident","expected_approval":true,"expected_tools":["lookup_customer","search_knowledge","create_ticket","request_approval"]}
+{"id":"general_ops","objective":"请帮业务运营团队登记一次普通流程优化建议：把每周报表归档动作加入待办","expected_category":"general","expected_approval":false,"expected_tools":["search_knowledge","create_ticket"]}

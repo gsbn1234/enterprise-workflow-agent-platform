@@ -1,0 +1,59 @@
+services:
+  workflow-agent:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: "${AGENT_BASE_IMAGE:-python:3.11-slim}"
+        SKIP_PIP_INSTALL: "${AGENT_SKIP_PIP_INSTALL:-false}"
+    image: enterprise-workflow-agent:latest
+    container_name: enterprise-workflow-agent
+    ports:
+      - "${AGENT_HOST_PORT:-8010}:8010"
+    environment:
+      AGENT_DB_PATH: /app/data/agent_platform.sqlite3
+      AGENT_AUTO_SEED: "true"
+      AGENT_APPROVAL_AMOUNT_THRESHOLD: "${AGENT_APPROVAL_AMOUNT_THRESHOLD:-500}"
+      AGENT_TOOL_RETRY_MAX_ATTEMPTS: "${AGENT_TOOL_RETRY_MAX_ATTEMPTS:-2}"
+      AGENT_TOOL_RETRY_BACKOFF_SECONDS: "${AGENT_TOOL_RETRY_BACKOFF_SECONDS:-0.2}"
+      AGENT_AUTH_REQUIRED: "${AGENT_AUTH_REQUIRED:-false}"
+      AGENT_AUTH_TOKEN_SECRET: "${AGENT_AUTH_TOKEN_SECRET:-change-this-local-secret}"
+      KNOWLEDGE_RAG_BASE_URL: "${KNOWLEDGE_RAG_BASE_URL:-}"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8010/api/health', timeout=3)); assert data['status'] == 'ok'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  workflow-worker:
+    image: enterprise-workflow-agent:latest
+    container_name: enterprise-workflow-worker
+    depends_on:
+      workflow-agent:
+        condition: service_healthy
+    command: ["python", "scripts/worker.py", "--worker-id", "docker-worker"]
+    environment:
+      AGENT_DB_PATH: /app/data/agent_platform.sqlite3
+      AGENT_AUTO_SEED: "true"
+      AGENT_JOB_POLL_INTERVAL_SECONDS: "${AGENT_JOB_POLL_INTERVAL_SECONDS:-2}"
+      AGENT_JOB_MAX_ATTEMPTS: "${AGENT_JOB_MAX_ATTEMPTS:-3}"
+      AGENT_APPROVAL_AMOUNT_THRESHOLD: "${AGENT_APPROVAL_AMOUNT_THRESHOLD:-500}"
+      AGENT_TOOL_RETRY_MAX_ATTEMPTS: "${AGENT_TOOL_RETRY_MAX_ATTEMPTS:-2}"
+      AGENT_TOOL_RETRY_BACKOFF_SECONDS: "${AGENT_TOOL_RETRY_BACKOFF_SECONDS:-0.2}"
+      AGENT_AUTH_REQUIRED: "${AGENT_AUTH_REQUIRED:-false}"
+      AGENT_AUTH_TOKEN_SECRET: "${AGENT_AUTH_TOKEN_SECRET:-change-this-local-secret}"
+      KNOWLEDGE_RAG_BASE_URL: "${KNOWLEDGE_RAG_BASE_URL:-}"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      disable: true
+    restart: unless-stopped

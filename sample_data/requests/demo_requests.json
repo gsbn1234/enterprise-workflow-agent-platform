@@ -1,0 +1,23 @@
+[
+  {
+    "title": "客户退款与安抚",
+    "description": "客户 Orbit Retail 投诉上月服务中断，要求退费 800 元，请创建工单并准备回复 support@orbit.example",
+    "requester_user_id": "alice",
+    "requester_department": "Customer Success",
+    "priority": "high"
+  },
+  {
+    "title": "P1 故障响应",
+    "description": "P1 故障：Acme China 反馈控制台无法访问，请创建故障工单并整理响应依据",
+    "requester_user_id": "bob",
+    "requester_department": "SRE",
+    "priority": "high"
+  },
+  {
+    "title": "采购登记",
+    "description": "运营团队想购买一个 300 元的数据清洗插件，请登记采购需求并给出处理建议",
+    "requester_user_id": "carol",
+    "requester_department": "Operations",
+    "priority": "normal"
+  }
+]
