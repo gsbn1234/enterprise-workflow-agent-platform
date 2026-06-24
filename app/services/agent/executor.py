@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import time
+import logging
 from typing import Any, Callable
 
 from app.db import get_connection, row_to_dict, rows_to_dicts
 from app.services.agent.planner import guard_objective, plan_workflow
 from app.services.agent.retry import RetryPolicy, classify_error, default_retry_policy
 from app.services.agent.state import WorkflowContext
+from app.services.agent.ticket_commands import execute_ticket_query, execute_ticket_update, parse_ticket_command
 from app.services.audit import record_audit
+from app.services.observability import start_span
 from app.services.requests import get_business_request, update_business_request_status
+from app.services.tenancy import effective_tenant_id
 from app.services.tools.approvals import create_approval, get_approval, mark_approval
 from app.services.tools.crm import lookup_customer
 from app.services.tools.email import draft_email, send_email
 from app.services.tools.knowledge import query_enterprise_rag, search_knowledge
+from app.services.tools.notifications import notify_internal_team
 from app.services.tools.ticketing import create_ticket, update_ticket
 from app.utils import compact_text, estimate_token_cost, json_dumps, json_loads, new_id, utc_now
+
+
+logger = logging.getLogger("agent_platform.workflow")
 
 
 def run_workflow(
@@ -23,9 +31,22 @@ def run_workflow(
     request_id: str | None = None,
     requester_user_id: str | None = None,
     requester_department: str | None = None,
+    requester_role: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict:
     started = time.perf_counter()
     run_id = new_id("run")
+    tenant = effective_tenant_id(tenant_id)
+    logger.info(
+        "workflow.run_started",
+        extra={
+            "event": "workflow.run_started",
+            "run_id": run_id,
+            "request_id": request_id,
+            "tenant_id": tenant,
+            "requester_user_id": requester_user_id,
+        },
+    )
     context = WorkflowContext(
         run_id=run_id,
         objective=objective,
@@ -38,22 +59,23 @@ def run_workflow(
         conn.execute(
             """
             INSERT INTO workflow_runs
-            (id, request_id, objective, status, created_at)
-            VALUES (?, ?, ?, 'running', ?)
+            (id, request_id, objective, tenant_id, status, created_at)
+            VALUES (?, ?, ?, ?, 'running', ?)
             """,
-            (run_id, request_id, objective, now),
+            (run_id, request_id, objective, tenant, now),
         )
-    record_audit("workflow.start", "workflow_run", run_id, {"request_id": request_id}, actor=requester_user_id or "agent")
+    record_audit("workflow.start", "workflow_run", run_id, {"request_id": request_id}, actor=requester_user_id or "agent", tenant_id=tenant)
 
-    guard = _run_step(
-        context,
-        "guard",
-        "policy_check",
-        None,
-        {"objective": objective},
-        lambda: guard_objective(objective),
-        "Check for prompt injection, approval bypass attempts, and destructive instructions.",
-    )
+    with start_span("workflow.run", {"workflow.run_id": run_id, "tenant.id": tenant, "workflow.request_id": request_id}):
+        guard = _run_step(
+            context,
+            "guard",
+            "policy_check",
+            None,
+            {"objective": objective},
+            lambda: guard_objective(objective),
+            "Check for prompt injection, approval bypass attempts, and destructive instructions.",
+        )
     if not guard["allowed"]:
         answer = guard["message"]
         _complete_run(
@@ -63,6 +85,80 @@ def run_workflow(
             started=started,
             refusal_reason=guard["reason"],
         )
+        return get_run_detail(run_id)
+
+    ticket_command = parse_ticket_command(objective)
+    if ticket_command:
+        command_payload = _run_step(
+            context,
+            "interpret_ticket_command",
+            "planner",
+            None,
+            {"objective": objective},
+            lambda: ticket_command.to_dict(),
+            "Recognize natural-language ticket query or update intent before creating any new work item.",
+        )
+        category = "ticket_update" if ticket_command.intent == "update" else "ticket_query"
+        _set_run_classification(run_id, category, "medium" if ticket_command.intent == "update" else "low", False)
+        if request_id:
+            update_business_request_status(request_id, "running", category)
+
+        if ticket_command.intent == "query":
+            query_result = _run_step(
+                context,
+                "query_existing_tickets",
+                "tool_call",
+                "query_tickets",
+                command_payload,
+                lambda: execute_ticket_query(
+                    ticket_command,
+                    requester_role=requester_role,
+                    requester_department=requester_department,
+                    tenant_id=tenant,
+                ),
+                "Query existing tickets with role and department visibility applied.",
+            )
+            if _has_step_error(query_result):
+                return _fail_workflow_from_tool_error(run_id, started, request_id, {"category": category}, "query_tickets", query_result)
+            _complete_run(
+                run_id,
+                status="completed",
+                final_answer=query_result.get("message") or "Ticket query completed.",
+                started=started,
+                needs_approval=False,
+            )
+            if request_id:
+                update_business_request_status(request_id, "completed", category)
+            return get_run_detail(run_id)
+
+        update_result = _run_step(
+            context,
+            "update_existing_ticket",
+            "tool_call",
+            "update_ticket",
+            command_payload,
+            lambda: execute_ticket_update(
+                ticket_command,
+                requester_user_id=requester_user_id,
+                requester_role=requester_role,
+                requester_department=requester_department,
+                tenant_id=tenant,
+            ),
+            "Update an existing ticket from natural-language instructions after permission checks.",
+        )
+        if _has_step_error(update_result):
+            return _fail_workflow_from_tool_error(run_id, started, request_id, {"category": category}, "update_ticket", update_result)
+        final_status = "refused" if update_result.get("error_code") == "permission_denied" else "completed"
+        _complete_run(
+            run_id,
+            status=final_status,
+            final_answer=update_result.get("message") or "Ticket update command finished.",
+            started=started,
+            needs_approval=False,
+            refusal_reason=update_result.get("error_code") if final_status == "refused" else None,
+        )
+        if request_id:
+            update_business_request_status(request_id, final_status, category)
         return get_run_detail(run_id)
 
     plan = _run_step(
@@ -114,16 +210,58 @@ def run_workflow(
     knowledge = _effective_knowledge(rag_knowledge, local_knowledge)
     context.artifacts["knowledge"] = knowledge
 
-    customer = _run_step(
-        context,
-        "collect_context",
-        "tool_call",
-        "lookup_customer",
-        {"query": objective},
-        lambda: lookup_customer(objective),
-        "Look up customer context when the request may involve an external user or account.",
-    )
+    customer = {"customer": None, "matched_by": None}
+    if _requires_customer_context(plan, objective):
+        customer = _run_step(
+            context,
+            "collect_customer_context",
+            "tool_call",
+            "lookup_customer",
+            {"query": objective},
+            lambda: lookup_customer(objective),
+            "Look up customer context only for customer-facing workflows such as refunds and complaints.",
+        )
     context.artifacts["customer"] = customer.get("customer")
+
+    if plan["needs_approval"]:
+        proposed_ticket = _proposed_ticket_payload(plan, objective, knowledge, customer.get("customer"), run_id)
+        approval_payload = {
+            "objective": objective,
+            "plan": plan,
+            "proposed_ticket": proposed_ticket,
+            "customer": customer.get("customer"),
+            "knowledge": knowledge.get("results", []),
+            "rag_citations": rag_knowledge.get("citations", []),
+            "requester_user_id": requester_user_id,
+            "requester_department": requester_department,
+        }
+        approval = _run_step(
+            context,
+            "request_approval",
+            "approval",
+            "request_approval",
+            approval_payload,
+            lambda: create_approval(
+                run_id,
+                plan.get("approval_action") or "business_action",
+                "create_ticket",
+                approval_payload,
+                requested_by="agent",
+                tenant_id=tenant,
+            ),
+            "Pause before creating external business artifacts; only approved requests create tickets.",
+        )
+        final_answer = _pending_approval_without_ticket_answer(plan, approval)
+        _complete_run(
+            run_id,
+            status="waiting_approval",
+            final_answer=final_answer,
+            started=started,
+            needs_approval=True,
+        )
+        if request_id:
+            update_business_request_status(request_id, "waiting_approval", plan["category"])
+        return get_run_detail(run_id)
 
     ticket = _run_step(
         context,
@@ -135,17 +273,77 @@ def run_workflow(
             "description": objective,
             "priority": plan["priority"],
             "owner_department": plan["recommended_owner"],
+            "workflow_type": plan.get("workflow_type"),
+            "category": plan.get("category"),
+            "risk_level": plan.get("risk_level"),
+            "approval_chain": plan.get("approval_chain") or [],
+            "auto_actions": plan.get("auto_actions") or [],
+            "blocked_actions": plan.get("blocked_actions") or [],
+            "agent_run_id": run_id,
         },
         lambda: create_ticket(
             _ticket_title(plan, objective),
-            _ticket_description(objective, knowledge),
+            _ticket_description(objective, plan, knowledge),
             customer_id=(customer.get("customer") or {}).get("id"),
             priority=plan["priority"],
             owner_department=plan["recommended_owner"],
+            workflow_type=plan.get("workflow_type"),
+            category=plan.get("category"),
+            risk_level=plan.get("risk_level"),
+            approval_chain=plan.get("approval_chain") or [],
+            auto_actions=plan.get("auto_actions") or [],
+            blocked_actions=plan.get("blocked_actions") or [],
+            evidence=knowledge.get("results", [])[:10],
+            agent_run_id=run_id,
+            tenant_id=tenant,
         ),
         "Create an auditable work item so the agent action is connected to business operations.",
     )
     context.artifacts["ticket"] = ticket
+    if _has_step_error(ticket) or not ticket.get("id"):
+        return _fail_workflow_from_tool_error(run_id, started, request_id, plan, "create_ticket", ticket)
+    _set_run_ticket(run_id, ticket["id"])
+
+    if _requires_internal_notification(plan):
+        notification = _run_step(
+            context,
+            "notify_internal_owner",
+            "tool_call",
+            "notify_internal_team",
+            {
+                "team": plan["recommended_owner"],
+                "message": _internal_notification_message(plan, ticket, objective),
+                "severity": plan["priority"],
+                "ticket_id": ticket["id"],
+            },
+            lambda: notify_internal_team(
+                plan["recommended_owner"],
+                _internal_notification_message(plan, ticket, objective),
+                severity=plan["priority"],
+                ticket_id=ticket["id"],
+                tenant_id=tenant,
+            ),
+            "Notify the responsible internal team while keeping an auditable notification record.",
+        )
+        context.artifacts["notification"] = notification
+        _run_step(
+            context,
+            "sync_ticket_notification",
+            "state_update",
+            "update_ticket",
+            {
+                "ticket_id": ticket["id"],
+                "comment": f"Internal notification sent to {plan['recommended_owner']}.",
+                "agent_run_id": run_id,
+            },
+            lambda: update_ticket(
+                ticket["id"],
+                comment=f"Internal notification sent to {plan['recommended_owner']}.",
+                agent_run_id=run_id,
+            )
+            or {"error": f"Ticket {ticket['id']} was not found."},
+            "Append the internal notification outcome to the external ticket timeline.",
+        )
 
     email_payload = _build_email_payload(objective, plan, customer.get("customer"), ticket, knowledge)
     if email_payload:
@@ -165,8 +363,11 @@ def run_workflow(
             "ticket_id": ticket["id"],
             "plan": plan,
             "email": context.artifacts.get("draft_email"),
+            "notification": context.artifacts.get("notification"),
             "knowledge": knowledge.get("results", []),
             "rag_citations": rag_knowledge.get("citations", []),
+            "requester_user_id": requester_user_id,
+            "requester_department": requester_department,
         }
         approval = _run_step(
             context,
@@ -176,13 +377,37 @@ def run_workflow(
             approval_payload,
             lambda: create_approval(
                 run_id,
-                "business_action",
+                plan.get("approval_action") or "business_action",
                 "send_email" if context.artifacts.get("draft_email") else "update_ticket",
                 approval_payload,
                 requested_by="agent",
+                tenant_id=tenant,
             ),
             "Pause before risky execution and ask a human to approve the proposed action.",
         )
+        approval_sync = _run_step(
+            context,
+            "sync_ticket_waiting_approval",
+            "state_update",
+            "update_ticket",
+            {
+                "ticket_id": ticket["id"],
+                "status": "waiting_approval",
+                "approval_id": approval.get("id"),
+                "agent_run_id": run_id,
+            },
+            lambda: update_ticket(
+                ticket["id"],
+                status="waiting_approval",
+                approval_id=approval.get("id"),
+                agent_run_id=run_id,
+                comment=f"Waiting for approval: {' -> '.join(plan.get('approval_chain') or []) or 'human reviewer'}.",
+            )
+            or {"error": f"Ticket {ticket['id']} was not found."},
+            "Mirror the approval pause to the external ticket system.",
+        )
+        if _has_step_error(approval_sync):
+            return _fail_workflow_from_tool_error(run_id, started, request_id, plan, "update_ticket", approval_sync)
         final_answer = _pending_answer(plan, ticket, approval)
         _complete_run(
             run_id,
@@ -203,20 +428,30 @@ def run_workflow(
             "tool_call",
             "send_email",
             context.artifacts["draft_email"],
-            lambda: send_email(**context.artifacts["draft_email"]),
+            lambda: send_email(**context.artifacts["draft_email"], tenant_id=tenant),
             "Send low-risk customer communication and keep an audit trail.",
         )
         context.artifacts["sent_email"] = sent_email
+        if _has_step_error(sent_email) or not sent_email.get("id"):
+            return _fail_workflow_from_tool_error(run_id, started, request_id, plan, "send_email", sent_email)
 
-    _run_step(
+    ticket_update = _run_step(
         context,
         "finalize",
         "state_update",
         "update_ticket",
-        {"ticket_id": ticket["id"], "status": "waiting_customer" if sent_email else "open"},
-        lambda: update_ticket(ticket["id"], status="waiting_customer" if sent_email else "open"),
+        {"ticket_id": ticket["id"], "status": _final_ticket_status(plan, sent_email)},
+        lambda: update_ticket(
+            ticket["id"],
+            status=_final_ticket_status(plan, sent_email),
+            comment=f"Workflow completed with final status {_final_ticket_status(plan, sent_email)}.",
+            agent_run_id=run_id,
+        )
+        or {"error": f"Ticket {ticket['id']} was not found."},
         "Move the ticket to the correct operational state after agent execution.",
     )
+    if _has_step_error(ticket_update):
+        return _fail_workflow_from_tool_error(run_id, started, request_id, plan, "update_ticket", ticket_update)
     final_answer = _completed_answer(plan, ticket, sent_email)
     _complete_run(run_id, status="completed", final_answer=final_answer, started=started)
     if request_id:
@@ -235,7 +470,12 @@ def decide_approval_and_resume(approval_id: str, approved: bool, decided_by: str
     run = _get_run_row(run_id)
     if not run:
         return None
+    tenant = effective_tenant_id(run.get("tenant_id"))
     context = WorkflowContext(run_id=run_id, objective=run["objective"])
+    payload = approval["payload"] or {}
+    plan = payload.get("plan") or {}
+    proposed_ticket = payload.get("proposed_ticket")
+    legacy_ticket_id = payload.get("ticket_id")
     if not approved:
         _run_step(
             context,
@@ -246,15 +486,193 @@ def decide_approval_and_resume(approval_id: str, approved: bool, decided_by: str
             lambda: {"status": "denied", "reason": reason},
             "Human reviewer denied the action; the workflow is cancelled safely.",
         )
+        denied_ticket_id = legacy_ticket_id
+        if denied_ticket_id:
+            _set_run_ticket(run_id, denied_ticket_id)
+            _run_step(
+                context,
+                "approval_reject_ticket",
+                "state_update",
+                "update_ticket",
+                {"ticket_id": denied_ticket_id, "status": "rejected", "approval_id": approval_id},
+                lambda: update_ticket(
+                    denied_ticket_id,
+                    status="rejected",
+                    comment=f"Approval denied by {decided_by}: {reason or 'no reason provided'}.",
+                    actor=decided_by,
+                    approval_id=approval_id,
+                    agent_run_id=run_id,
+                )
+                or {"error": f"Ticket {denied_ticket_id} was not found."},
+                "Mark the operational ticket as rejected when the human reviewer denies the action.",
+            )
         _complete_run(
             run_id,
             status="cancelled",
-            final_answer=f"审批已拒绝，Agent 未执行风险动作。原因：{reason or '未填写'}",
+            final_answer=_approval_denied_answer(reason, bool(denied_ticket_id)),
             started=None,
         )
         return get_run_detail(run_id)
 
-    payload = approval["payload"]
+    if proposed_ticket and not legacy_ticket_id:
+        ticket = _run_step(
+            context,
+            "approval_create_ticket",
+            "tool_call",
+            "create_ticket",
+            {**proposed_ticket, "approval_id": approval_id},
+            lambda: create_ticket(
+                proposed_ticket["title"],
+                proposed_ticket["description"],
+                customer_id=proposed_ticket.get("customer_id"),
+                priority=proposed_ticket.get("priority") or "normal",
+                owner_department=proposed_ticket.get("owner_department") or "Business Ops",
+                workflow_type=proposed_ticket.get("workflow_type"),
+                category=proposed_ticket.get("category"),
+                risk_level=proposed_ticket.get("risk_level"),
+                approval_chain=proposed_ticket.get("approval_chain") or [],
+                auto_actions=proposed_ticket.get("auto_actions") or [],
+                blocked_actions=proposed_ticket.get("blocked_actions") or [],
+                evidence=proposed_ticket.get("evidence") or [],
+                agent_run_id=run_id,
+                approval_id=approval_id,
+                tenant_id=tenant,
+            ),
+            "Human approval was granted; create the external operational ticket now.",
+        )
+        if _has_step_error(ticket) or not ticket.get("id"):
+            _complete_run(
+                run_id,
+                status="failed",
+                final_answer=_tool_failure_message("create_ticket", ticket),
+                started=None,
+            )
+            return get_run_detail(run_id)
+        _set_run_ticket(run_id, ticket["id"])
+
+        if _requires_internal_notification(plan):
+            notification = _run_step(
+                context,
+                "approval_notify_internal_owner",
+                "tool_call",
+                "notify_internal_team",
+                {
+                    "team": plan.get("recommended_owner"),
+                    "message": _internal_notification_message(plan, ticket, run["objective"]),
+                    "severity": plan.get("priority") or ticket.get("priority") or "normal",
+                    "ticket_id": ticket["id"],
+                    "approval_id": approval_id,
+                },
+                lambda: notify_internal_team(
+                    plan.get("recommended_owner") or "Operations",
+                    _internal_notification_message(plan, ticket, run["objective"]),
+                    severity=plan.get("priority") or ticket.get("priority") or "normal",
+                    ticket_id=ticket["id"],
+                    tenant_id=tenant,
+                ),
+                "Notify the responsible internal team after approval creates the ticket.",
+            )
+            _run_step(
+                context,
+                "approval_sync_ticket_notification",
+                "state_update",
+                "update_ticket",
+                {
+                    "ticket_id": ticket["id"],
+                    "comment": f"Internal notification sent after approval {approval_id}.",
+                    "approval_id": approval_id,
+                },
+                lambda: update_ticket(
+                    ticket["id"],
+                    comment=f"Internal notification sent after approval {approval_id}.",
+                    actor=decided_by,
+                    approval_id=approval_id,
+                    agent_run_id=run_id,
+                    evidence=[notification] if isinstance(notification, dict) else None,
+                )
+                or {"error": f"Ticket {ticket['id']} was not found."},
+                "Append the internal notification outcome to the ticket timeline.",
+            )
+
+        knowledge = {"results": payload.get("knowledge") or []}
+        email_payload_after_approval = _build_email_payload(run["objective"], plan, payload.get("customer"), ticket, knowledge)
+        sent_email_after_approval = None
+        if email_payload_after_approval:
+            draft = _run_step(
+                context,
+                "approval_draft_email",
+                "tool_call",
+                "draft_email",
+                email_payload_after_approval,
+                lambda: draft_email(**email_payload_after_approval),
+                "Prepare the customer response after the human approval gate.",
+            )
+            if _has_step_error(draft):
+                _complete_run(
+                    run_id,
+                    status="failed",
+                    final_answer=_tool_failure_message("draft_email", draft),
+                    started=None,
+                )
+                return get_run_detail(run_id)
+            sent_email_after_approval = _run_step(
+                context,
+                "approval_execute_email",
+                "tool_call",
+                "send_email",
+                {**draft, "approval_id": approval_id},
+                lambda: send_email(
+                    draft["to_address"],
+                    draft["subject"],
+                    draft["body"],
+                    approval_id=approval_id,
+                    tenant_id=tenant,
+                ),
+                "Human approval was granted; send the customer email.",
+            )
+            if _has_step_error(sent_email_after_approval) or not sent_email_after_approval.get("id"):
+                _complete_run(
+                    run_id,
+                    status="failed",
+                    final_answer=_tool_failure_message("send_email", sent_email_after_approval),
+                    started=None,
+                )
+                return get_run_detail(run_id)
+
+        ticket_update = _run_step(
+            context,
+            "approval_finalize_ticket",
+            "state_update",
+            "update_ticket",
+            {"ticket_id": ticket["id"], "status": _final_ticket_status(plan, sent_email_after_approval), "approval_id": approval_id},
+            lambda: update_ticket(
+                ticket["id"],
+                status=_final_ticket_status(plan, sent_email_after_approval),
+                comment=f"Approval granted by {decided_by}; ticket created and workflow resumed.",
+                actor=decided_by,
+                approval_id=approval_id,
+                agent_run_id=run_id,
+            )
+            or {"error": f"Ticket {ticket['id']} was not found."},
+            "Finalize the newly created ticket after approved execution.",
+        )
+        if _has_step_error(ticket_update):
+            _complete_run(
+                run_id,
+                status="failed",
+                final_answer=_tool_failure_message("update_ticket", ticket_update),
+                started=None,
+            )
+            return get_run_detail(run_id)
+
+        _complete_run(
+            run_id,
+            status="completed",
+            final_answer=_approval_created_ticket_answer(ticket, sent_email_after_approval),
+            started=None,
+        )
+        return get_run_detail(run_id)
+
     email_payload = payload.get("email")
     sent_email = None
     if approval["tool_name"] == "send_email" and email_payload:
@@ -269,39 +687,75 @@ def decide_approval_and_resume(approval_id: str, approved: bool, decided_by: str
                 email_payload["subject"],
                 email_payload["body"],
                 approval_id=approval_id,
+                tenant_id=tenant,
             ),
             "Human approval was granted; execute the previously paused email action.",
         )
+        if _has_step_error(sent_email) or not sent_email.get("id"):
+            _complete_run(
+                run_id,
+                status="failed",
+                final_answer=_tool_failure_message("send_email", sent_email),
+                started=None,
+            )
+            return get_run_detail(run_id)
 
     ticket_id = payload.get("ticket_id")
     if ticket_id:
-        _run_step(
+        _set_run_ticket(run_id, ticket_id)
+        plan = payload.get("plan") or {}
+        ticket_update = _run_step(
             context,
             "approval_update_ticket",
             "state_update",
             "update_ticket",
-            {"ticket_id": ticket_id, "status": "waiting_customer" if sent_email else "approved"},
-            lambda: update_ticket(ticket_id, status="waiting_customer" if sent_email else "approved"),
+            {"ticket_id": ticket_id, "status": _final_ticket_status(plan, sent_email), "approval_id": approval_id},
+            lambda: update_ticket(
+                ticket_id,
+                status=_final_ticket_status(plan, sent_email),
+                comment=f"Approval granted by {decided_by}; workflow resumed.",
+                actor=decided_by,
+                approval_id=approval_id,
+                agent_run_id=run_id,
+            )
+            or {"error": f"Ticket {ticket_id} was not found."},
             "Update the operational ticket after approval execution.",
         )
+        if _has_step_error(ticket_update):
+            _complete_run(
+                run_id,
+                status="failed",
+                final_answer=_tool_failure_message("update_ticket", ticket_update),
+                started=None,
+            )
+            return get_run_detail(run_id)
 
-    answer = "审批已通过，Agent 已继续执行暂停的业务动作。"
-    if sent_email:
-        answer += f" 已发送邮件 {sent_email['id']}。"
+    answer = _approval_legacy_completed_answer(sent_email)
     _complete_run(run_id, status="completed", final_answer=answer, started=None)
     return get_run_detail(run_id)
 
 
-def list_runs(limit: int = 100) -> list[dict]:
+def list_runs(limit: int = 100, tenant_id: str | None = None) -> list[dict]:
     with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM workflow_runs
-            ORDER BY created_at DESC, id DESC
-            LIMIT ?
-            """,
-            (max(1, min(limit, 500)),),
-        ).fetchall()
+        if tenant_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM workflow_runs
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (tenant_id, max(1, min(limit, 500))),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM workflow_runs
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, min(limit, 500)),),
+            ).fetchall()
     return rows_to_dicts(rows)
 
 
@@ -347,7 +801,17 @@ def _run_step(
     for attempt_index in range(1, max_attempts + 1):
         attempt_started = time.perf_counter()
         try:
-            output = fn()
+            with start_span(
+                "workflow.step",
+                {
+                    "workflow.run_id": context.run_id,
+                    "workflow.node_name": node_name,
+                    "workflow.action_type": action_type,
+                    "workflow.tool_name": tool_name or "",
+                    "workflow.attempt": attempt_index,
+                },
+            ):
+                output = fn()
             attempts.append(
                 {
                     "attempt": attempt_index,
@@ -360,6 +824,19 @@ def _run_step(
             break
         except Exception as exc:
             error_type = classify_error(exc)
+            logger.warning(
+                "workflow.step_failed",
+                extra={
+                    "event": "workflow.step_failed",
+                    "run_id": context.run_id,
+                    "node_name": node_name,
+                    "action_type": action_type,
+                    "tool_name": tool_name,
+                    "attempt": attempt_index,
+                    "error_type": error_type,
+                    "error": str(exc),
+                },
+            )
             is_last_attempt = attempt_index >= max_attempts
             attempts.append(
                 {
@@ -410,6 +887,33 @@ def _run_step(
     return output
 
 
+def _has_step_error(output: dict | None) -> bool:
+    return not isinstance(output, dict) or bool(output.get("error"))
+
+
+def _tool_failure_message(tool_name: str, output: dict | None) -> str:
+    if isinstance(output, dict):
+        reason = output.get("error") or output.get("message") or "Tool returned an invalid payload."
+    else:
+        reason = "Tool returned an invalid payload."
+    return f"{tool_name} failed: {reason}"
+
+
+def _fail_workflow_from_tool_error(
+    run_id: str,
+    started: float,
+    request_id: str | None,
+    plan: dict | None,
+    tool_name: str,
+    output: dict | None,
+) -> dict:
+    final_answer = _tool_failure_message(tool_name, output)
+    _complete_run(run_id, status="failed", final_answer=final_answer, started=started)
+    if request_id:
+        update_business_request_status(request_id, "failed", (plan or {}).get("category"))
+    return get_run_detail(run_id)
+
+
 def _elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
 
@@ -424,6 +928,17 @@ def _next_step_index(run_id: str) -> int:
 
 
 def _update_run_plan(run_id: str, plan: dict) -> None:
+    _set_run_classification(run_id, plan["category"], plan["risk_level"], bool(plan["needs_approval"]))
+
+
+def _set_run_ticket(run_id: str, ticket_id: str | None) -> None:
+    if not ticket_id:
+        return
+    with get_connection() as conn:
+        conn.execute("UPDATE workflow_runs SET ticket_id = COALESCE(ticket_id, ?) WHERE id = ?", (ticket_id, run_id))
+
+
+def _set_run_classification(run_id: str, category: str, risk_level: str, needs_approval: bool) -> None:
     with get_connection() as conn:
         conn.execute(
             """
@@ -431,7 +946,7 @@ def _update_run_plan(run_id: str, plan: dict) -> None:
             SET category = ?, risk_level = ?, needs_approval = ?
             WHERE id = ?
             """,
-            (plan["category"], plan["risk_level"], int(plan["needs_approval"]), run_id),
+            (category, risk_level, int(needs_approval), run_id),
         )
 
 
@@ -472,7 +987,25 @@ def _complete_run(
                 run_id,
             ),
         )
-    record_audit("workflow.complete", "workflow_run", run_id, {"status": status})
+    run = _get_run_row(run_id)
+    logger.info(
+        "workflow.run_completed",
+        extra={
+            "event": "workflow.run_completed",
+            "run_id": run_id,
+            "tenant_id": (run or {}).get("tenant_id"),
+            "status": status,
+            "latency_ms": latency_ms,
+            "estimated_cost": cost,
+        },
+    )
+    record_audit(
+        "workflow.complete",
+        "workflow_run",
+        run_id,
+        {"status": status},
+        tenant_id=(run or {}).get("tenant_id"),
+    )
 
 
 def _get_run_row(run_id: str) -> dict | None:
@@ -481,8 +1014,55 @@ def _get_run_row(run_id: str) -> dict | None:
     return row_to_dict(row)
 
 
+def _requires_customer_context(plan: dict, objective: str) -> bool:
+    if plan.get("category") in {"refund", "complaint", "communication"}:
+        return True
+    return False
+
+
+def _requires_internal_notification(plan: dict) -> bool:
+    return plan.get("category") in {"security", "access_request", "incident"} or plan.get("workflow_type") in {
+        "security_incident_response",
+        "access_request_fulfillment",
+        "incident_response",
+    }
+
+
+def _internal_notification_message(plan: dict, ticket: dict, objective: str) -> str:
+    return (
+        f"Agent 已创建 {plan.get('workflow_type', 'business')} 工单 {ticket['id']}。"
+        f"风险等级：{plan.get('risk_level')}；负责人：{plan.get('recommended_owner')}；"
+        f"禁止动作：{', '.join(plan.get('blocked_actions') or []) or '-'}。"
+        f"原始请求：{compact_text(objective, 220)}"
+    )
+
+
+def _final_ticket_status(plan: dict, sent_email: dict | None = None) -> str:
+    if sent_email:
+        return "waiting_customer"
+    return plan.get("final_ticket_status") or "open"
+
+
 def _ticket_title(plan: dict, objective: str) -> str:
     return f"[{plan['category']}/{plan['risk_level']}] {compact_text(objective, 72)}"
+
+
+def _proposed_ticket_payload(plan: dict, objective: str, knowledge: dict, customer: dict | None, run_id: str) -> dict:
+    return {
+        "title": _ticket_title(plan, objective),
+        "description": _ticket_description(objective, plan, knowledge),
+        "customer_id": (customer or {}).get("id"),
+        "priority": plan["priority"],
+        "owner_department": plan["recommended_owner"],
+        "workflow_type": plan.get("workflow_type"),
+        "category": plan.get("category"),
+        "risk_level": plan.get("risk_level"),
+        "approval_chain": plan.get("approval_chain") or [],
+        "auto_actions": plan.get("auto_actions") or [],
+        "blocked_actions": plan.get("blocked_actions") or [],
+        "evidence": knowledge.get("results", [])[:10],
+        "agent_run_id": run_id,
+    }
 
 
 def _effective_knowledge(rag_knowledge: dict, local_knowledge: dict) -> dict:
@@ -513,9 +1093,20 @@ def _effective_knowledge(rag_knowledge: dict, local_knowledge: dict) -> dict:
     }
 
 
-def _ticket_description(objective: str, knowledge: dict) -> str:
+def _ticket_description(objective: str, plan: dict, knowledge: dict) -> str:
     evidence = "\n".join(f"- {item['title']}: {item['snippet']}" for item in knowledge.get("results", [])[:3])
-    return f"用户请求：{objective}\n\n检索到的政策依据：\n{evidence or '- 未命中明确政策'}"
+    approval_chain = " -> ".join(plan.get("approval_chain") or []) or "无需人工审批"
+    auto_actions = "\n".join(f"- {item}" for item in plan.get("auto_actions") or []) or "- 无"
+    blocked_actions = "\n".join(f"- {item}" for item in plan.get("blocked_actions") or []) or "- 无"
+    return (
+        f"用户请求：{objective}\n\n"
+        f"流程类型：{plan.get('workflow_type')}\n"
+        f"分类/风险：{plan.get('category')} / {plan.get('risk_level')}\n"
+        f"审批链：{approval_chain}\n\n"
+        f"Agent 可自动执行：\n{auto_actions}\n\n"
+        f"Agent 不会直接执行：\n{blocked_actions}\n\n"
+        f"检索到的政策依据：\n{evidence or '- 未命中明确政策'}"
+    )
 
 
 def _build_email_payload(
@@ -525,7 +1116,11 @@ def _build_email_payload(
     ticket: dict,
     knowledge: dict,
 ) -> dict | None:
-    recipient = plan.get("recipient_email") or (customer or {}).get("email")
+    if plan.get("category") not in {"refund", "complaint", "communication"}:
+        return None
+    recipient = plan.get("recipient_email")
+    if not recipient and plan.get("category") in {"refund", "complaint", "communication"}:
+        recipient = (customer or {}).get("email")
     if not recipient:
         return None
     policy_titles = "、".join(item["title"] for item in knowledge.get("results", [])[:2]) or "内部处理规范"
@@ -540,17 +1135,53 @@ def _build_email_payload(
     return {"to_address": recipient, "subject": subject, "body": body}
 
 
-def _pending_answer(plan: dict, ticket: dict, approval: dict) -> str:
+def _pending_approval_without_ticket_answer(plan: dict, approval: dict) -> str:
+    chain = " -> ".join(plan.get("approval_chain") or []) or "负责人"
     return (
-        f"已创建工单 {ticket['id']}，分类 {plan['category']}，风险等级 {plan['risk_level']}。"
-        f"由于该动作需要人工审批，已创建审批单 {approval['id']}，当前等待负责人确认。"
+        f"已生成审批草案 {approval['id']}，当前等待 {chain} 确认。"
+        "审批通过前不会创建外部工单、不会发送邮件，也不会执行高风险业务动作。"
+    )
+
+
+def _approval_denied_answer(reason: str | None, legacy_ticket_rejected: bool = False) -> str:
+    if legacy_ticket_rejected:
+        return f"审批已拒绝，旧流程中已创建的工单已标记为 rejected；未继续发送邮件或执行后续动作。原因：{reason or '未填写'}"
+    return f"审批已拒绝，未创建外部工单、未发送邮件，也未执行高风险业务动作。原因：{reason or '未填写'}"
+
+
+def _approval_created_ticket_answer(ticket: dict, sent_email: dict | None) -> str:
+    ticket_ref = ticket.get("external_id") or ticket.get("id")
+    answer = f"审批已通过，已创建外部工单 {ticket_ref} 并完成状态同步。"
+    if sent_email:
+        answer += f" 已发送客户邮件 {sent_email['id']}。"
+    else:
+        answer += " 本次流程不需要发送客户邮件，已保留工单、知识依据和审计记录。"
+    return answer
+
+
+def _approval_legacy_completed_answer(sent_email: dict | None) -> str:
+    answer = "审批已通过，Agent 已继续执行暂停的业务动作。"
+    if sent_email:
+        answer += f" 已发送邮件 {sent_email['id']}。"
+    return answer
+
+
+def _pending_answer(plan: dict, ticket: dict, approval: dict) -> str:
+    chain = " -> ".join(plan.get("approval_chain") or []) or "负责人"
+    return (
+        f"已创建工单 {ticket['id']}，流程 {plan.get('workflow_type')}，分类 {plan['category']}，风险等级 {plan['risk_level']}。"
+        f"由于该动作需要 {chain} 审批，已创建审批单 {approval['id']}，当前等待确认。"
+        f"Agent 不会直接执行：{', '.join(plan.get('blocked_actions') or []) or '无'}。"
     )
 
 
 def _completed_answer(plan: dict, ticket: dict, sent_email: dict | None) -> str:
-    answer = f"已完成低风险自动化处理：创建工单 {ticket['id']}，分类 {plan['category']}。"
+    answer = (
+        f"已完成 {plan.get('workflow_type')} 流程：创建工单 {ticket['id']}，"
+        f"分类 {plan['category']}，最终状态 {_final_ticket_status(plan, sent_email)}。"
+    )
     if sent_email:
         answer += f" 已发送客户邮件 {sent_email['id']}。"
     else:
-        answer += " 未检测到可直接发送的外部收件人，因此只保留工单和处理建议。"
+        answer += " 本场景不需要直接发送客户邮件，已保留工单、知识依据和审计记录。"
     return answer

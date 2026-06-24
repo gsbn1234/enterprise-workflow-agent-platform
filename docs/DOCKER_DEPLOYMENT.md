@@ -153,7 +153,33 @@ workflow_jobs.status = queued
 queued -> running -> completed / failed
 ```
 
-## 6. 当前 Docker 形态
+## 6. PostgreSQL 版 HR/生产化 Demo
+
+完整版 HR Demo 会同时启动 Agent、Agent Worker、Agent PostgreSQL、RAG、pgvector 和外部工单系统：
+
+```powershell
+Copy-Item .env.hr-demo.example .env.hr-demo
+docker compose --env-file .env.hr-demo -f docker-compose.prod.yml up --build -d
+```
+
+这个 compose 中 Agent 主库已经使用 PostgreSQL：
+
+```text
+AGENT_DB_BACKEND=postgres
+AGENT_DATABASE_URL=postgresql://agent:agent_password@agent-postgres:5432/agent
+AGENT_POSTGRES_SCHEMA=agent_app
+```
+
+本地可以只启动 Agent PostgreSQL 做数据库烟测：
+
+```powershell
+docker compose --env-file .env.hr-demo -f docker-compose.prod.yml up -d agent-postgres
+.\.venv\Scripts\python.exe scripts\postgres_smoke_test.py
+```
+
+如果没有启动 PostgreSQL，烟测会显示 `agent_postgres_smoke=skipped`，不会误报成功。
+
+## 7. 当前 Docker 形态
 
 当前 compose 包含两个应用容器：
 

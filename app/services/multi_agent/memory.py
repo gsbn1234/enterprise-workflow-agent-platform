@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.db import get_connection, row_to_dict, rows_to_dicts
+from app.services.tenancy import effective_tenant_id
 from app.utils import json_dumps, json_loads, new_id, utc_now
 
 
@@ -10,18 +11,20 @@ def add_memory(
     summary: str,
     detail: dict,
     *,
+    tenant_id: str | None = None,
     source_run_id: str | None = None,
     score: float = 0,
 ) -> dict:
     memory_id = new_id("mem")
+    tenant = effective_tenant_id(tenant_id)
     with get_connection() as conn:
         conn.execute(
             """
             INSERT INTO agent_memory
-            (id, memory_type, memory_key, summary, detail_json, source_run_id, score, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (id, memory_type, memory_key, summary, detail_json, tenant_id, source_run_id, score, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (memory_id, memory_type, memory_key, summary, json_dumps(detail), source_run_id, score, utc_now()),
+            (memory_id, memory_type, memory_key, summary, json_dumps(detail), tenant, source_run_id, score, utc_now()),
         )
     return get_memory(memory_id)
 
@@ -35,9 +38,19 @@ def get_memory(memory_id: str) -> dict | None:
     return memory
 
 
-def list_memories(limit: int = 100, memory_type: str | None = None) -> list[dict]:
+def list_memories(limit: int = 100, memory_type: str | None = None, tenant_id: str | None = None) -> list[dict]:
     with get_connection() as conn:
-        if memory_type:
+        if memory_type and tenant_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM agent_memory
+                WHERE memory_type = ? AND tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (memory_type, tenant_id, max(1, min(limit, 500))),
+            ).fetchall()
+        elif memory_type:
             rows = conn.execute(
                 """
                 SELECT * FROM agent_memory
@@ -46,6 +59,16 @@ def list_memories(limit: int = 100, memory_type: str | None = None) -> list[dict
                 LIMIT ?
                 """,
                 (memory_type, max(1, min(limit, 500))),
+            ).fetchall()
+        elif tenant_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM agent_memory
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (tenant_id, max(1, min(limit, 500))),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -62,9 +85,9 @@ def list_memories(limit: int = 100, memory_type: str | None = None) -> list[dict
     return memories
 
 
-def search_similar_memories(query: str, limit: int = 5) -> list[dict]:
+def search_similar_memories(query: str, limit: int = 5, tenant_id: str | None = None) -> list[dict]:
     terms = {part.lower() for part in query.split() if len(part) >= 2}
-    memories = list_memories(limit=200)
+    memories = list_memories(limit=200, tenant_id=tenant_id)
     scored = []
     for memory in memories:
         haystack = f"{memory['memory_key']} {memory['summary']} {memory.get('detail', {})}".lower()

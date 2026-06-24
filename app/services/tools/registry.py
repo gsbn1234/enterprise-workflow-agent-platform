@@ -8,7 +8,8 @@ from app.services.tools.approvals import create_approval
 from app.services.tools.crm import lookup_customer
 from app.services.tools.email import draft_email
 from app.services.tools.knowledge import query_enterprise_rag, search_knowledge
-from app.services.tools.ticketing import create_ticket, update_ticket
+from app.services.tools.notifications import notify_internal_team
+from app.services.tools.ticketing import create_ticket, query_tickets, update_ticket
 from app.utils import compact_text
 
 
@@ -21,6 +22,7 @@ def request_approval(
     tool_name: str,
     payload: dict,
     requested_by: str = "mcp",
+    tenant_id: str | None = None,
 ) -> dict:
     return create_approval(
         run_id=run_id,
@@ -28,6 +30,7 @@ def request_approval(
         tool_name=tool_name,
         payload=payload,
         requested_by=requested_by,
+        tenant_id=tenant_id,
     )
 
 
@@ -36,8 +39,10 @@ TOOL_REGISTRY: dict[str, ToolFn] = {
     "search_knowledge": search_knowledge,
     "lookup_customer": lookup_customer,
     "create_ticket": create_ticket,
+    "query_tickets": query_tickets,
     "update_ticket": update_ticket,
     "draft_email": draft_email,
+    "notify_internal_team": notify_internal_team,
     "request_approval": request_approval,
 }
 
@@ -108,23 +113,57 @@ TOOL_SPECS: list[dict[str, Any]] = [
                 "customer_id": {"type": ["string", "null"]},
                 "priority": {"type": "string", "default": "normal"},
                 "owner_department": {"type": "string", "default": "Customer Success"},
+                "workflow_type": {"type": ["string", "null"]},
+                "category": {"type": ["string", "null"]},
+                "risk_level": {"type": ["string", "null"]},
+                "approval_chain": {"type": "array", "items": {"type": "string"}, "default": []},
+                "auto_actions": {"type": "array", "items": {"type": "string"}, "default": []},
+                "blocked_actions": {"type": "array", "items": {"type": "string"}, "default": []},
+                "evidence": {"type": "array", "items": {"type": "object"}, "default": []},
+                "agent_run_id": {"type": ["string", "null"]},
+                "approval_id": {"type": ["string", "null"]},
             },
             "required": ["title", "description"],
         },
-        "output_shape": {"id": "string", "status": "string", "priority": "string"},
+        "output_shape": {"id": "string", "status": "string", "priority": "string", "external_url": "string|null"},
         "side_effect": True,
         "requires_approval": False,
         "required_role": "employee",
     },
     {
+        "name": "query_tickets",
+        "description": "Query existing tickets by id, external id, status, priority, department, or free text.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticket_ref": {"type": ["string", "null"]},
+                "status": {"type": ["string", "null"]},
+                "priority": {"type": ["string", "null"]},
+                "owner_department": {"type": ["string", "null"]},
+                "q": {"type": ["string", "null"]},
+                "limit": {"type": "integer", "default": 50},
+            },
+        },
+        "output_shape": {"tickets": "array", "count": "integer", "filters": "object"},
+        "side_effect": False,
+        "requires_approval": False,
+        "required_role": "employee",
+    },
+    {
         "name": "update_ticket",
-        "description": "Update ticket status or owner department.",
+        "description": "Update ticket status, owner, or append an operational timeline comment.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "ticket_id": {"type": "string", "minLength": 1},
                 "status": {"type": ["string", "null"]},
                 "owner_department": {"type": ["string", "null"]},
+                "priority": {"type": ["string", "null"]},
+                "comment": {"type": ["string", "null"]},
+                "actor": {"type": "string", "default": "agent"},
+                "approval_id": {"type": ["string", "null"]},
+                "agent_run_id": {"type": ["string", "null"]},
+                "evidence": {"type": ["array", "null"], "items": {"type": "object"}},
             },
             "required": ["ticket_id"],
         },
@@ -151,6 +190,26 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "required_role": "employee",
     },
     {
+        "name": "notify_internal_team",
+        "description": "Notify an internal team through the simulated enterprise notification channel and preserve audit evidence.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team": {"type": "string", "minLength": 1},
+                "message": {"type": "string", "minLength": 1},
+                "severity": {"type": "string", "default": "normal"},
+                "ticket_id": {"type": ["string", "null"]},
+                "channel": {"type": "string", "default": "internal_queue"},
+                "tenant_id": {"type": ["string", "null"]},
+            },
+            "required": ["team", "message"],
+        },
+        "output_shape": {"id": "string", "team": "string", "status": "string", "audit_id": "string"},
+        "side_effect": True,
+        "requires_approval": False,
+        "required_role": "employee",
+    },
+    {
         "name": "request_approval",
         "description": "Create a human approval request for a risky action.",
         "input_schema": {
@@ -161,6 +220,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
                 "tool_name": {"type": "string", "minLength": 1},
                 "payload": {"type": "object"},
                 "requested_by": {"type": "string", "default": "mcp"},
+                "tenant_id": {"type": ["string", "null"]},
             },
             "required": ["run_id", "action_type", "tool_name", "payload"],
         },

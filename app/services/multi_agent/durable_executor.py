@@ -21,6 +21,7 @@ from app.services.multi_agent.agents import (
     SupervisorAgent,
     ToolExecutionAgent,
 )
+from app.services.tenancy import effective_tenant_id
 from app.utils import json_dumps, json_loads, new_id, utc_now
 
 
@@ -32,6 +33,7 @@ class MultiAgentState(TypedDict, total=False):
     requester_user_id: str | None
     requester_department: str | None
     requester_role: str | None
+    tenant_id: str
     max_correction_attempts: int
     correction_attempts: int
     enable_self_correction: bool
@@ -60,6 +62,7 @@ def run_multi_agent_durable(
     requester_user_id: str | None = None,
     requester_department: str | None = None,
     requester_role: str | None = None,
+    tenant_id: str | None = None,
     enable_self_correction: bool = True,
     max_correction_attempts: int = 1,
     replay_of_run_id: str | None = None,
@@ -68,15 +71,16 @@ def run_multi_agent_durable(
     started = time.perf_counter()
     run_id = new_id("ma")
     thread_id = f"multi-agent:{run_id}"
+    tenant = effective_tenant_id(tenant_id)
     with get_connection() as conn:
         conn.execute(
             """
             INSERT INTO multi_agent_runs
-            (id, objective, requester_user_id, requester_department, status,
+            (id, objective, requester_user_id, requester_department, tenant_id, status,
              executor_type, thread_id, correction_count, replay_of_run_id, created_at)
-            VALUES (?, ?, ?, ?, 'running', 'durable_langgraph', ?, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'running', 'durable_langgraph', ?, 0, ?, ?)
             """,
-            (run_id, objective, requester_user_id, requester_department, thread_id, replay_of_run_id, utc_now()),
+            (run_id, objective, requester_user_id, requester_department, tenant, thread_id, replay_of_run_id, utc_now()),
         )
     record_audit(
         "multi_agent.start",
@@ -84,6 +88,7 @@ def run_multi_agent_durable(
         run_id,
         {"requester": requester_user_id, "executor": "durable_langgraph", "replay_of_run_id": replay_of_run_id},
         actor=requester_user_id or "agent",
+        tenant_id=tenant,
     )
 
     checkpoint_conn = sqlite3.connect(str(_langgraph_checkpoint_path()), check_same_thread=False)
@@ -98,6 +103,7 @@ def run_multi_agent_durable(
         "requester_user_id": requester_user_id,
         "requester_department": requester_department,
         "requester_role": requester_role,
+        "tenant_id": tenant,
         "max_correction_attempts": max(0, min(max_correction_attempts, 3)),
         "correction_attempts": 0,
         "enable_self_correction": enable_self_correction,
@@ -113,10 +119,18 @@ def run_multi_agent_durable(
             run_id,
             {"score": final_state.get("critic_report", {}).get("score"), "corrections": final_state.get("correction_attempts", 0)},
             actor=requester_user_id or "agent",
+            tenant_id=tenant,
         )
     except Exception as exc:
         _fail_run(run_id, started, exc)
-        record_audit("multi_agent.failed", "multi_agent_run", run_id, {"error": str(exc)}, actor=requester_user_id or "agent")
+        record_audit(
+            "multi_agent.failed",
+            "multi_agent_run",
+            run_id,
+            {"error": str(exc)},
+            actor=requester_user_id or "agent",
+            tenant_id=tenant,
+        )
     finally:
         checkpoint_conn.close()
     return _get_multi_agent_run(run_id)
@@ -159,7 +173,12 @@ def _build_graph(context: DurableRunContext):
 
 def _memory_retrieve_node(state: MultiAgentState, context: DurableRunContext) -> dict:
     memory = MemoryAgent()
-    content = _run_agent_message(context.run_id, memory.name, "context", lambda: memory.retrieve(state["objective"]))
+    content = _run_agent_message(
+        context.run_id,
+        memory.name,
+        "context",
+        lambda: memory.retrieve(state["objective"], tenant_id=state.get("tenant_id")),
+    )
     update = {"memory_context": content}
     _record_checkpoint(context, "memory_retrieve", {**state, **update})
     return update
@@ -230,6 +249,8 @@ def _tool_execution_node(state: MultiAgentState, context: DurableRunContext) -> 
             state.get("active_objective") or state["objective"],
             requester_user_id=state.get("requester_user_id"),
             requester_department=state.get("requester_department"),
+            requester_role=state.get("requester_role"),
+            tenant_id=state.get("tenant_id"),
         ),
     )
     update = {"execution_output": content}
@@ -300,6 +321,7 @@ def _memory_write_node(state: MultiAgentState, context: DurableRunContext) -> di
             state.get("active_objective") or state["objective"],
             state["critic_report"],
             state["execution_output"]["workflow_run_id"],
+            tenant_id=state.get("tenant_id"),
         ),
     )
     update = {"memory_item": content}
@@ -408,6 +430,7 @@ def _checkpoint_state(state: dict) -> dict:
         "requester_user_id",
         "requester_department",
         "requester_role",
+        "tenant_id",
         "memory_context",
         "supervisor_output",
         "research_output",
@@ -486,7 +509,7 @@ def _get_multi_agent_run(run_id: str) -> dict:
             """
             SELECT * FROM multi_agent_messages
             WHERE run_id = ?
-            ORDER BY rowid ASC
+            ORDER BY created_at ASC, id ASC
             """,
             (run_id,),
         ).fetchall()

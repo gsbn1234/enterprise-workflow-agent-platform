@@ -26,3 +26,9 @@ class PlanDecision:
     recommended_owner: str
     reason: str
     proposed_tools: list[str]
+    workflow_type: str
+    approval_chain: list[str]
+    blocked_actions: list[str]
+    auto_actions: list[str]
+    final_ticket_status: str
+    approval_action: str

@@ -17,6 +17,8 @@ services:
       AGENT_TOOL_RETRY_BACKOFF_SECONDS: "${AGENT_TOOL_RETRY_BACKOFF_SECONDS:-0.2}"
       AGENT_AUTH_REQUIRED: "${AGENT_AUTH_REQUIRED:-false}"
       AGENT_AUTH_TOKEN_SECRET: "${AGENT_AUTH_TOKEN_SECRET:-change-this-local-secret}"
+      AGENT_METRICS_ENABLED: "${AGENT_METRICS_ENABLED:-true}"
+      AGENT_METRICS_AUTH_REQUIRED: "${AGENT_METRICS_AUTH_REQUIRED:-false}"
       KNOWLEDGE_RAG_BASE_URL: "${KNOWLEDGE_RAG_BASE_URL:-}"
     volumes:
       - ./data:/app/data
@@ -26,7 +28,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8010/api/health', timeout=3)); assert data['status'] == 'ok'",
+          "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8010/api/readiness', timeout=3)); assert data['status'] == 'ok'; assert data['database']['status'] == 'ok'",
         ]
       interval: 30s
       timeout: 5s
@@ -51,6 +53,8 @@ services:
       AGENT_TOOL_RETRY_BACKOFF_SECONDS: "${AGENT_TOOL_RETRY_BACKOFF_SECONDS:-0.2}"
       AGENT_AUTH_REQUIRED: "${AGENT_AUTH_REQUIRED:-false}"
       AGENT_AUTH_TOKEN_SECRET: "${AGENT_AUTH_TOKEN_SECRET:-change-this-local-secret}"
+      AGENT_METRICS_ENABLED: "${AGENT_METRICS_ENABLED:-true}"
+      AGENT_METRICS_AUTH_REQUIRED: "${AGENT_METRICS_AUTH_REQUIRED:-false}"
       KNOWLEDGE_RAG_BASE_URL: "${KNOWLEDGE_RAG_BASE_URL:-}"
     volumes:
       - ./data:/app/data

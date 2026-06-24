@@ -1,0 +1,400 @@
+name: enterprise-agent-hr-demo
+
+x-agent-build: &agent-build
+  context: "${AGENT_BUILD_CONTEXT:-.}"
+  args:
+    BASE_IMAGE: "${AGENT_BASE_IMAGE:-python:3.11-slim}"
+    NODE_IMAGE: "${AGENT_NODE_IMAGE:-node:22-slim}"
+    SKIP_PIP_INSTALL: "${AGENT_SKIP_PIP_INSTALL:-false}"
+
+x-agent-env: &agent-env
+  AGENT_ENV: "${AGENT_ENV:-staging}"
+  AGENT_PUBLIC_BASE_URL: "${AGENT_PUBLIC_BASE_URL:-http://127.0.0.1:${AGENT_HOST_PORT:-8010}}"
+  AGENT_CORS_ORIGINS: "${AGENT_CORS_ORIGINS:-http://127.0.0.1:${AGENT_HOST_PORT:-8010}}"
+  AGENT_TRUSTED_HOSTS: "${AGENT_TRUSTED_HOSTS:-}"
+  AGENT_ENABLE_SECURITY_HEADERS: "${AGENT_ENABLE_SECURITY_HEADERS:-true}"
+  AGENT_METRICS_ENABLED: "${AGENT_METRICS_ENABLED:-true}"
+  AGENT_METRICS_AUTH_REQUIRED: "${AGENT_METRICS_AUTH_REQUIRED:-true}"
+  AGENT_SERVICE_NAME: "${AGENT_SERVICE_NAME:-enterprise-workflow-agent}"
+  AGENT_SERVICE_VERSION: "${AGENT_SERVICE_VERSION:-hr-demo}"
+  AGENT_LOG_LEVEL: "${AGENT_LOG_LEVEL:-INFO}"
+  AGENT_LOG_FORMAT: "${AGENT_LOG_FORMAT:-json}"
+  AGENT_OTEL_ENABLED: "${AGENT_OTEL_ENABLED:-true}"
+  AGENT_OTEL_SERVICE_NAME: "${AGENT_OTEL_SERVICE_NAME:-enterprise-workflow-agent}"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+  OTEL_EXPORTER_OTLP_HEADERS: "${OTEL_EXPORTER_OTLP_HEADERS:-}"
+  AGENT_OTEL_EXPORT_CONSOLE: "${AGENT_OTEL_EXPORT_CONSOLE:-true}"
+  AGENT_DB_BACKEND: "postgres"
+  AGENT_DATABASE_URL: "postgresql://${AGENT_POSTGRES_USER:-agent}:${AGENT_POSTGRES_PASSWORD:-agent_password}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agent}"
+  AGENT_MIGRATION_DATABASE_URL: "postgresql://${AGENT_POSTGRES_MIGRATION_USER:-agent}:${AGENT_POSTGRES_MIGRATION_PASSWORD:-agent_password}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agent}"
+  AGENT_WORKER_DATABASE_URL: "postgresql://${AGENT_POSTGRES_WORKER_USER:-agent}:${AGENT_POSTGRES_WORKER_PASSWORD:-agent_password}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agent}"
+  AGENT_READONLY_DATABASE_URL: "postgresql://${AGENT_POSTGRES_READONLY_USER:-agent}:${AGENT_POSTGRES_READONLY_PASSWORD:-agent_password}@agent-postgres:5432/${AGENT_POSTGRES_DB:-agent}"
+  AGENT_POSTGRES_SCHEMA: "${AGENT_POSTGRES_SCHEMA:-agent_app}"
+  AGENT_POSTGRES_RLS_ENABLED: "${AGENT_POSTGRES_RLS_ENABLED:-true}"
+  AGENT_POSTGRES_RLS_BYPASS_ROLE: "${AGENT_POSTGRES_RLS_BYPASS_ROLE:-}"
+  AGENT_TENANT_ISOLATION_ENABLED: "${AGENT_TENANT_ISOLATION_ENABLED:-true}"
+  AGENT_DEFAULT_TENANT_ID: "${AGENT_DEFAULT_TENANT_ID:-hr-demo}"
+  AGENT_DB_PATH: /app/data/agent_platform.sqlite3
+  AGENT_AUTO_MIGRATE: "${AGENT_AUTO_MIGRATE:-false}"
+  AGENT_AUTO_SEED: "true"
+  AGENT_AUTH_REQUIRED: "true"
+  AGENT_AUTH_TOKEN_SECRET: "${AGENT_AUTH_TOKEN_SECRET:-replace-this-hr-demo-secret}"
+  AGENT_ACCESS_TOKEN_EXPIRE_MINUTES: "${AGENT_ACCESS_TOKEN_EXPIRE_MINUTES:-480}"
+  AGENT_OIDC_ENABLED: "${AGENT_OIDC_ENABLED:-true}"
+  AGENT_OIDC_BROWSER_LOGIN_ENABLED: "${AGENT_OIDC_BROWSER_LOGIN_ENABLED:-true}"
+  AGENT_OIDC_ISSUER: "${AGENT_OIDC_ISSUER:-http://127.0.0.1:8030}"
+  AGENT_OIDC_AUDIENCE: "${AGENT_OIDC_AUDIENCE:-agent-platform}"
+  AGENT_OIDC_JWKS_URL: "${AGENT_OIDC_JWKS_URL:-http://local-oidc-provider:8030/oauth2/v1/jwks}"
+  AGENT_OIDC_AUTHORIZATION_URL: "${AGENT_OIDC_AUTHORIZATION_URL:-http://127.0.0.1:8030/oauth2/v1/authorize}"
+  AGENT_OIDC_TOKEN_URL: "${AGENT_OIDC_TOKEN_URL:-http://local-oidc-provider:8030/oauth2/v1/token}"
+  AGENT_OIDC_CLIENT_ID: "${AGENT_OIDC_CLIENT_ID:-agent-platform}"
+  AGENT_OIDC_CLIENT_SECRET: "${AGENT_OIDC_CLIENT_SECRET:-local-oidc-demo-client-secret}"
+  AGENT_OIDC_REDIRECT_URI: "${AGENT_OIDC_REDIRECT_URI:-http://127.0.0.1:8010/api/auth/oidc/callback}"
+  AGENT_OIDC_SCOPES: "${AGENT_OIDC_SCOPES:-openid,profile,email}"
+  AGENT_OIDC_ALGORITHMS: "${AGENT_OIDC_ALGORITHMS:-RS256}"
+  AGENT_OIDC_TENANT_CLAIM: "${AGENT_OIDC_TENANT_CLAIM:-tenant_id}"
+  AGENT_OIDC_ADMIN_GROUPS: "${AGENT_OIDC_ADMIN_GROUPS:-agent-admins}"
+  AGENT_OIDC_MANAGER_GROUPS: "${AGENT_OIDC_MANAGER_GROUPS:-agent-approvers}"
+  AGENT_OIDC_DEFAULT_ROLE: "${AGENT_OIDC_DEFAULT_ROLE:-employee}"
+  AGENT_OIDC_DEFAULT_DEPARTMENT: "${AGENT_OIDC_DEFAULT_DEPARTMENT:-Operations}"
+  AGENT_SCIM_ENABLED: "${AGENT_SCIM_ENABLED:-true}"
+  AGENT_SCIM_TOKEN: "${AGENT_SCIM_TOKEN:-replace-this-scim-token}"
+  AGENT_APPROVAL_AMOUNT_THRESHOLD: "${AGENT_APPROVAL_AMOUNT_THRESHOLD:-500}"
+  AGENT_EXTERNAL_EMAIL_REQUIRES_APPROVAL: "true"
+  AGENT_QUEUE_BACKEND: "${AGENT_QUEUE_BACKEND:-redis}"
+  AGENT_REDIS_URL: "${AGENT_REDIS_URL:-redis://agent-redis:6379/0}"
+  AGENT_REDIS_QUEUE_NAME: "${AGENT_REDIS_QUEUE_NAME:-agent:workflow_jobs}"
+  AGENT_REDIS_BLOCK_TIMEOUT_SECONDS: "${AGENT_REDIS_BLOCK_TIMEOUT_SECONDS:-5}"
+  AGENT_TOOL_RETRY_MAX_ATTEMPTS: "${AGENT_TOOL_RETRY_MAX_ATTEMPTS:-2}"
+  AGENT_TOOL_RETRY_BACKOFF_SECONDS: "${AGENT_TOOL_RETRY_BACKOFF_SECONDS:-0.2}"
+  AGENT_OUTBOX_DISPATCHER_ENABLED: "${AGENT_OUTBOX_DISPATCHER_ENABLED:-true}"
+  AGENT_EMBEDDED_OUTBOX_DISPATCHER_ENABLED: "${AGENT_EMBEDDED_OUTBOX_DISPATCHER_ENABLED:-false}"
+  AGENT_OUTBOX_DISPATCH_INTERVAL_SECONDS: "${AGENT_OUTBOX_DISPATCH_INTERVAL_SECONDS:-5}"
+  AGENT_OUTBOX_DISPATCH_BATCH_SIZE: "${AGENT_OUTBOX_DISPATCH_BATCH_SIZE:-20}"
+  AGENT_OUTBOX_MAX_ATTEMPTS: "${AGENT_OUTBOX_MAX_ATTEMPTS:-5}"
+  AGENT_OUTBOX_RETRY_BACKOFF_SECONDS: "${AGENT_OUTBOX_RETRY_BACKOFF_SECONDS:-30}"
+  AGENT_AUDIT_RETENTION_DAYS: "${AGENT_AUDIT_RETENTION_DAYS:-365}"
+  AGENT_EVAL_REPORT_RETENTION_DAYS: "${AGENT_EVAL_REPORT_RETENTION_DAYS:-90}"
+  AGENT_EXTERNAL_OUTBOX_RETENTION_DAYS: "${AGENT_EXTERNAL_OUTBOX_RETENTION_DAYS:-90}"
+  AGENT_EMAIL_RETENTION_DAYS: "${AGENT_EMAIL_RETENTION_DAYS:-180}"
+  AGENT_WORKFLOW_JOB_RETENTION_DAYS: "${AGENT_WORKFLOW_JOB_RETENTION_DAYS:-30}"
+  AGENT_LOGIN_ATTEMPT_RETENTION_DAYS: "${AGENT_LOGIN_ATTEMPT_RETENTION_DAYS:-90}"
+  KNOWLEDGE_RAG_BASE_URL: "http://rag-app:8000"
+  AGENT_TOOL_MODE: "real"
+  AGENT_TICKET_PROVIDER: "http"
+  TICKET_API_URL: "http://external-ticket-service:8020/api/tickets"
+  TICKET_API_TOKEN: "${TICKET_SERVICE_TOKEN:-replace-this-ticket-token}"
+  TICKET_API_TIMEOUT_SECONDS: "${TICKET_API_TIMEOUT_SECONDS:-15}"
+  TICKET_HTTP_ID_FIELD: "id"
+  TICKET_HTTP_URL_FIELD: "url"
+  AGENT_EMAIL_PROVIDER: "${AGENT_EMAIL_PROVIDER:-mock}"
+  AGENT_EMAIL_ALLOWLIST: "${AGENT_EMAIL_ALLOWLIST:-@example.com}"
+  SMTP_HOST: "${SMTP_HOST:-}"
+  SMTP_PORT: "${SMTP_PORT:-587}"
+  SMTP_USERNAME: "${SMTP_USERNAME:-}"
+  SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+  SMTP_FROM_EMAIL: "${SMTP_FROM_EMAIL:-}"
+  SMTP_USE_TLS: "${SMTP_USE_TLS:-true}"
+  SMTP_USE_SSL: "${SMTP_USE_SSL:-false}"
+
+services:
+  agent-postgres:
+    image: postgres:16
+    container_name: hr-agent-postgres
+    environment:
+      POSTGRES_DB: "${AGENT_POSTGRES_DB:-agent}"
+      POSTGRES_USER: "${AGENT_POSTGRES_USER:-agent}"
+      POSTGRES_PASSWORD: "${AGENT_POSTGRES_PASSWORD:-agent_password}"
+    ports:
+      - "${AGENT_POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - agent_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AGENT_POSTGRES_USER:-agent} -d ${AGENT_POSTGRES_DB:-agent}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  agent-redis:
+    image: redis:7-alpine
+    container_name: hr-agent-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${AGENT_REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - agent_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  rag-postgres:
+    image: pgvector/pgvector:pg16
+    container_name: hr-rag-postgres
+    environment:
+      POSTGRES_DB: "${RAG_POSTGRES_DB:-rag}"
+      POSTGRES_USER: "${RAG_POSTGRES_USER:-rag}"
+      POSTGRES_PASSWORD: "${RAG_POSTGRES_PASSWORD:-rag_password}"
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - rag_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RAG_POSTGRES_USER:-rag} -d ${RAG_POSTGRES_DB:-rag}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  rag-app:
+    build:
+      context: "${RAG_BUILD_CONTEXT:-../企业知识库 RAG 系统}"
+      dockerfile: Dockerfile
+    image: enterprise-knowledge-rag:hr-demo
+    container_name: hr-rag-app
+    depends_on:
+      rag-postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        python scripts/import_documents.py --raw-dir sample_docs/raw --skip-existing || echo "RAG demo document import skipped; service will still start."
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      RAG_DATA_DIR: /app/data
+      RAG_UPLOAD_DIR: /app/data/uploads
+      RAG_DB_BACKEND: "postgres"
+      RAG_DATABASE_URL: "postgresql://${RAG_POSTGRES_USER:-rag}:${RAG_POSTGRES_PASSWORD:-rag_password}@rag-postgres:5432/${RAG_POSTGRES_DB:-rag}"
+      RAG_POSTGRES_SCHEMA: "${RAG_POSTGRES_SCHEMA:-rag_app}"
+      RAG_VECTOR_BACKEND: "pgvector"
+      RAG_PGVECTOR_DSN: "postgresql://${RAG_POSTGRES_USER:-rag}:${RAG_POSTGRES_PASSWORD:-rag_password}@rag-postgres:5432/${RAG_POSTGRES_DB:-rag}"
+      RAG_PGVECTOR_NAMESPACE: "${RAG_PGVECTOR_NAMESPACE:-hr_demo}"
+      RAG_EMBEDDING_PROVIDER: "${RAG_EMBEDDING_PROVIDER:-local_hash}"
+      RAG_LOCAL_EMBEDDING_DIMENSION: "${RAG_LOCAL_EMBEDDING_DIMENSION:-384}"
+      RAG_LLM_PROVIDER: "${RAG_LLM_PROVIDER:-local_extractive}"
+      RAG_RERANK_PROVIDER: "${RAG_RERANK_PROVIDER:-none}"
+      RAG_JUDGE_PROVIDER: "${RAG_JUDGE_PROVIDER:-local_rule}"
+      RAG_AUTH_REQUIRED: "${RAG_AUTH_REQUIRED:-false}"
+      RAG_AUTH_TOKEN_SECRET: "${RAG_AUTH_TOKEN_SECRET:-replace-this-rag-demo-secret}"
+      RAG_PDF_OCR_ENABLED: "${RAG_PDF_OCR_ENABLED:-false}"
+      RAG_OCR_TABLE_EXTRACTION_ENABLED: "${RAG_OCR_TABLE_EXTRACTION_ENABLED:-false}"
+      RAG_QUERY_EXPANSION_RULES_PATH: "config/query_expansion_rules.json"
+    ports:
+      - "${RAG_HOST_PORT:-8000}:8000"
+    volumes:
+      - rag_app_data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)); assert data['status'] == 'ok'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  external-ticket-service:
+    build: *agent-build
+    image: enterprise-workflow-agent:hr-demo
+    container_name: hr-external-ticket-service
+    command: ["uvicorn", "external_ticket_service.server:app", "--host", "0.0.0.0", "--port", "8020"]
+    environment:
+      TICKET_SERVICE_DB_PATH: /ticket-data/external_ticket_service.sqlite3
+      TICKET_SERVICE_TOKEN: "${TICKET_SERVICE_TOKEN:-replace-this-ticket-token}"
+      TICKET_SERVICE_PUBLIC_BASE_URL: "${TICKET_SERVICE_PUBLIC_BASE_URL:-http://127.0.0.1:8020}"
+    ports:
+      - "${TICKET_HOST_PORT:-8020}:8020"
+    volumes:
+      - ticket_service_data:/ticket-data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8020/api/tickets', timeout=3))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  local-oidc-provider:
+    build: *agent-build
+    image: enterprise-workflow-agent:hr-demo
+    container_name: hr-local-oidc-provider
+    command: ["uvicorn", "external_oidc_provider.server:app", "--host", "0.0.0.0", "--port", "8030"]
+    environment:
+      LOCAL_IDP_ISSUER: "${AGENT_OIDC_ISSUER:-http://127.0.0.1:8030}"
+      LOCAL_IDP_AUDIENCE: "${AGENT_OIDC_AUDIENCE:-agent-platform}"
+      LOCAL_IDP_CLIENT_ID: "${AGENT_OIDC_CLIENT_ID:-agent-platform}"
+      LOCAL_IDP_CLIENT_SECRET: "${AGENT_OIDC_CLIENT_SECRET:-local-oidc-demo-client-secret}"
+      LOCAL_IDP_REDIRECT_URI: "${AGENT_OIDC_REDIRECT_URI:-http://127.0.0.1:8010/api/auth/oidc/callback}"
+      LOCAL_IDP_KEY_ID: "${LOCAL_IDP_KEY_ID:-local-demo-key}"
+    ports:
+      - "${OIDC_HOST_PORT:-8030}:8030"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=3)); assert data['status'] == 'ok'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  workflow-migrate:
+    build: *agent-build
+    image: enterprise-workflow-agent:hr-demo
+    container_name: hr-workflow-migrate
+    depends_on:
+      agent-postgres:
+        condition: service_healthy
+      agent-redis:
+        condition: service_healthy
+    command: ["python", "scripts/migrate.py", "--seed", "--demo-users"]
+    environment: *agent-env
+    volumes:
+      - agent_data:/app/data
+    restart: "no"
+
+  workflow-agent:
+    build: *agent-build
+    image: enterprise-workflow-agent:hr-demo
+    container_name: hr-workflow-agent
+    depends_on:
+      workflow-migrate:
+        condition: service_completed_successfully
+      agent-redis:
+        condition: service_healthy
+      rag-app:
+        condition: service_healthy
+      external-ticket-service:
+        condition: service_healthy
+      local-oidc-provider:
+        condition: service_healthy
+    environment: *agent-env
+    ports:
+      - "${AGENT_HOST_PORT:-8010}:8010"
+    volumes:
+      - agent_data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8010/api/readiness', timeout=3)); assert data['status'] == 'ok'; assert data['database']['status'] == 'ok'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  workflow-worker:
+    build: *agent-build
+    image: enterprise-workflow-agent:hr-demo
+    container_name: hr-workflow-worker
+    depends_on:
+      workflow-agent:
+        condition: service_healthy
+      agent-redis:
+        condition: service_healthy
+    command: ["python", "scripts/worker.py", "--worker-id", "hr-demo-worker"]
+    environment:
+      <<: *agent-env
+      AGENT_JOB_POLL_INTERVAL_SECONDS: "${AGENT_JOB_POLL_INTERVAL_SECONDS:-2}"
+      AGENT_JOB_MAX_ATTEMPTS: "${AGENT_JOB_MAX_ATTEMPTS:-3}"
+    volumes:
+      - agent_data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from app.db import set_connection_purpose, database_status; from app.services.queue import queue_status; set_connection_purpose('worker'); db=database_status(); q=queue_status(check_connection=True); assert db['status'] == 'ok'; assert (not q['enabled']) or q.get('reachable') is True",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  workflow-outbox-dispatcher:
+    build: *agent-build
+    image: enterprise-workflow-agent:hr-demo
+    container_name: hr-workflow-outbox-dispatcher
+    depends_on:
+      workflow-agent:
+        condition: service_healthy
+    command: ["python", "scripts/outbox_dispatcher.py"]
+    environment: *agent-env
+    volumes:
+      - agent_data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from app.db import set_connection_purpose, database_status; set_connection_purpose('worker'); assert database_status()['status'] == 'ok'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  workflow-retention-worker:
+    build: *agent-build
+    image: enterprise-workflow-agent:hr-demo
+    container_name: hr-workflow-retention-worker
+    depends_on:
+      workflow-agent:
+        condition: service_healthy
+    command:
+      [
+        "python",
+        "scripts/retention_worker.py",
+        "--interval-seconds",
+        "${AGENT_RETENTION_WORKER_INTERVAL_SECONDS:-3600}",
+      ]
+    environment: *agent-env
+    volumes:
+      - agent_data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from app.db import set_connection_purpose, database_status; from app.services.retention import retention_status; set_connection_purpose('worker'); assert database_status()['status'] == 'ok'; assert retention_status()['enabled'] is True",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  agent_postgres_data:
+  agent_redis_data:
+  agent_data:
+  ticket_service_data:
+  rag_app_data:
+  rag_postgres_data:

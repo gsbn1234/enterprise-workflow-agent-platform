@@ -8,6 +8,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 os.environ["AGENT_AUTH_REQUIRED"] = "true"
 os.environ["AGENT_DB_PATH"] = str(ROOT / "data" / "auth_smoke_test.sqlite3")
+os.environ["AGENT_TOOL_MODE"] = "mock"
+os.environ["AGENT_TICKET_PROVIDER"] = "mock"
+os.environ["AGENT_EMAIL_PROVIDER"] = "mock"
+os.environ["KNOWLEDGE_RAG_BASE_URL"] = ""
 sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -32,11 +36,15 @@ def main() -> None:
     ensure_demo_users()
 
     with TestClient(app) as client:
+        readiness = client.get("/api/readiness")
+        assert readiness.status_code == 200, readiness.text
+        assert readiness.json()["database"]["status"] == "ok", readiness.text
+
         blocked = client.post("/api/workflow/run", json={"objective": "未登录请求"})
         assert blocked.status_code == 401, blocked.text
 
         alice = login(client, "alice", "AlicePass123")
-        manager = login(client, "manager", "ManagerPass123")
+        manager = login(client, "cs_manager", "ManagerPass123")
         admin = login(client, "admin", "AdminPass123")
 
         run_response = client.post(
@@ -71,6 +79,30 @@ def main() -> None:
         admin_users = client.get("/api/users", headers=auth_header(admin))
         assert admin_users.status_code == 200, admin_users.text
         assert len(admin_users.json()) >= 3, admin_users.text
+
+        employee_preflight = client.get("/api/admin/preflight", headers=auth_header(alice))
+        assert employee_preflight.status_code == 403, employee_preflight.text
+
+        admin_preflight = client.get("/api/admin/preflight", headers=auth_header(admin))
+        assert admin_preflight.status_code == 200, admin_preflight.text
+        assert admin_preflight.json()["database"]["status"] == "ok", admin_preflight.text
+
+        admin_dashboard = client.get("/api/admin/operations-dashboard", headers=auth_header(admin))
+        assert admin_dashboard.status_code == 200, admin_dashboard.text
+        assert "workflow_runs" in admin_dashboard.json()["statuses"], admin_dashboard.text
+        assert "external_outbox" in admin_dashboard.json()["statuses"], admin_dashboard.text
+
+        employee_outbox = client.get("/api/admin/external-outbox", headers=auth_header(alice))
+        assert employee_outbox.status_code == 403, employee_outbox.text
+
+        admin_outbox = client.get("/api/admin/external-outbox", headers=auth_header(admin))
+        assert admin_outbox.status_code == 200, admin_outbox.text
+        assert any(item["action_type"] in {"ticket.create", "email.send"} for item in admin_outbox.json()), admin_outbox.text
+
+        logout_response = client.post("/api/auth/logout", headers=auth_header(alice))
+        assert logout_response.status_code == 200, logout_response.text
+        revoked_me = client.get("/api/auth/me", headers=auth_header(alice))
+        assert revoked_me.status_code == 401, revoked_me.text
 
     print("auth_smoke_test passed")
 

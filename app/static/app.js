@@ -1,21 +1,55 @@
 const state = {
   activeTab: "tickets",
+  user: null,
 };
 
 const $ = (id) => document.getElementById(id);
 
 async function api(path, options = {}) {
   const token = localStorage.getItem("agent_access_token");
-  const authHeaders = token ? { Authorization: `Bearer ${token}` } : {};
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...authHeaders, ...(options.headers || {}) },
-    ...options,
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || response.statusText);
+  const headers = new Headers(options.headers || {});
+  if (!headers.has("Content-Type") && options.body) {
+    headers.set("Content-Type", "application/json");
   }
-  return response.json();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  const response = await fetch(path, { ...options, headers });
+  const isJson = (response.headers.get("content-type") || "").includes("application/json");
+  const data = isJson ? await response.json() : await response.text();
+  if (!response.ok) {
+    const detail = typeof data === "object" ? data.detail || JSON.stringify(data) : data;
+    throw new Error(detail || response.statusText);
+  }
+  return data;
+}
+
+async function logoutCurrentUser() {
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+  } catch (_error) {
+    // Local fallback: the token may already be expired or revoked.
+  } finally {
+    localStorage.removeItem("agent_access_token");
+  }
+}
+
+function showMessage(text, tone = "info") {
+  const el = $("message");
+  el.textContent = text || "";
+  el.className = `message ${tone}`;
+}
+
+async function withButton(button, label, task) {
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = label;
+  try {
+    return await task();
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
 }
 
 function escapeHtml(value) {
@@ -31,7 +65,7 @@ function statusBadge(value) {
   return `<span class="status ${escapeHtml(value || "")}">${escapeHtml(value || "unknown")}</span>`;
 }
 
-function short(value, limit = 120) {
+function short(value, limit = 160) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
 }
@@ -44,320 +78,232 @@ function formPayload() {
   };
 }
 
+async function loadHealth() {
+  try {
+    const health = await api("/api/health");
+    $("health").textContent = `${health.status} · ${health.app}`;
+  } catch (error) {
+    $("health").textContent = error.message;
+  }
+}
+
 async function loadMe() {
   const token = localStorage.getItem("agent_access_token");
   if (!token) {
-    $("me").textContent = "";
-    return;
+    state.user = null;
+    $("me").textContent = "未登录";
+    return null;
   }
   try {
-    const me = await api("/api/auth/me");
-    $("me").textContent = `${me.id} · ${me.role}`;
-  } catch (error) {
+    state.user = await api("/api/auth/me");
+    $("me").textContent = `${state.user.id} · ${state.user.role}`;
+    return state.user;
+  } catch {
     localStorage.removeItem("agent_access_token");
-    $("me").textContent = "";
+    state.user = null;
+    $("me").textContent = "未登录";
+    return null;
   }
 }
 
-async function loadHealth() {
-  const health = await api("/api/health");
-  $("health").textContent = `${health.status} · ${health.db_path}`;
-}
-
-async function loadMetrics() {
-  const metrics = await api("/api/metrics/summary");
-  const totals = metrics.totals;
-  $("metrics").innerHTML = [
-    ["Runs", totals.runs],
-    ["Pending", totals.pending_approvals],
-    ["Tickets", totals.tickets],
-    ["Emails", totals.emails],
-    ["Jobs", totals.jobs],
-    ["Avg ms", Math.round(totals.avg_latency_ms || 0)],
-    ["Cost", Number(totals.estimated_cost || 0).toFixed(6)],
-  ]
-    .map(([label, value]) => `<div class="metric"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`)
-    .join("");
-}
-
-async function loadMultiAgentRuns() {
-  const runs = await api("/api/multi-agent/runs?limit=8");
-  const details = [];
-  for (const run of runs.slice(0, 4)) {
-    details.push(await api(`/api/multi-agent/runs/${run.id}`));
-  }
-  $("multiAgentRuns").innerHTML =
-    details
-      .map((run) => {
-        const messages = run.messages || [];
-        const findings = run.critic_report?.findings || [];
-        return `
-          <article class="item">
-            <div class="item-title">
-              <strong>${escapeHtml(short(run.objective, 92))}</strong>
-              ${statusBadge(run.status)}
-            </div>
-            <div class="muted">
-              critic=${Number(run.critic_score || 0).toFixed(0)}
-              · corrections=${escapeHtml(run.correction_count || 0)}
-              · ${escapeHtml(run.executor_type || "executor")}
-              · workflow=${escapeHtml(run.workflow_run_id || "n/a")}
-              · ${escapeHtml(run.latency_ms || 0)}ms
-            </div>
-            <pre>${escapeHtml(run.final_summary || "")}</pre>
-            <div class="agent-track">
-              ${messages
-                .map(
-                  (message) => `
-                    <div class="agent-step">
-                      <code>${escapeHtml(message.agent_name)}</code>
-                      <span>${escapeHtml(message.role)} · ${escapeHtml(message.status)} · ${escapeHtml(message.latency_ms)}ms</span>
-                    </div>
-                  `,
-                )
-                .join("")}
-            </div>
-            ${
-              findings.length
-                ? `<pre>${escapeHtml(JSON.stringify(findings, null, 2))}</pre>`
-                : `<div class="muted success-line">critic passed</div>`
-            }
-            <div class="item-actions">
-              <button class="secondary" data-save-golden="${escapeHtml(run.id)}">保存 Golden</button>
-              <button class="secondary" data-replay-run="${escapeHtml(run.id)}">Replay</button>
-            </div>
-          </article>
-        `;
-      })
-      .join("") || `<div class="muted">暂无多智能体运行记录</div>`;
-
-  document.querySelectorAll("[data-save-golden]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const name = window.prompt("Golden trace name", `golden-${button.dataset.saveGolden}`);
-      if (!name) return;
-      await api("/api/golden-traces", {
-        method: "POST",
-        body: JSON.stringify({ run_id: button.dataset.saveGolden, name }),
-      });
-      await refreshAll();
-    });
-  });
-  document.querySelectorAll("[data-replay-run]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await api("/api/trace-replay", {
-        method: "POST",
-        body: JSON.stringify({ source_run_id: button.dataset.replayRun }),
-      });
-      await refreshAll();
-    });
-  });
-}
-
-async function loadRuns() {
-  const runs = await api("/api/runs?limit=12");
-  const details = [];
-  for (const run of runs.slice(0, 6)) {
-    details.push(await api(`/api/runs/${run.id}`));
-  }
-  $("runs").innerHTML =
-    details
-      .map(
-        (run) => `
-          <article class="item">
-            <div class="item-title">
-              <strong>${escapeHtml(short(run.objective, 90))}</strong>
-              ${statusBadge(run.status)}
-            </div>
-            <div class="muted">${escapeHtml(run.category || "unclassified")} · ${escapeHtml(run.risk_level || "n/a")} · ${escapeHtml(run.latency_ms)}ms</div>
-            <pre>${escapeHtml(run.final_answer || "")}</pre>
-            <div class="steps">
-              ${run.steps
-                .map(
-                  (step) => `
-                    <div class="step">
-                      <code>#${escapeHtml(step.step_index)}</code>
-                      <code>${escapeHtml(step.node_name)}</code>
-                      <span>${escapeHtml(step.tool_name || step.action_type)} · ${escapeHtml(step.latency_ms)}ms${step.attempt_count > 1 ? ` · attempts ${escapeHtml(step.attempt_count)}/${escapeHtml(step.max_attempts)}` : ""}</span>
-                    </div>
-                  `,
-                )
-                .join("")}
-            </div>
-          </article>
-        `,
-      )
-      .join("") || `<div class="muted">暂无运行记录</div>`;
-}
-
-async function loadJobs() {
-  const jobs = await api("/api/jobs?limit=12");
-  $("jobs").innerHTML =
-    jobs
-      .map(
-        (job) => `
-          <article class="item">
-            <div class="item-title">
-              <strong>${escapeHtml(short(job.objective, 74))}</strong>
-              ${statusBadge(job.status)}
-            </div>
-            <div class="muted">${escapeHtml(job.id)} · attempts ${escapeHtml(job.attempts)}/${escapeHtml(job.max_attempts)}</div>
-            ${job.run_id ? `<pre>run_id=${escapeHtml(job.run_id)}</pre>` : ""}
-            ${job.error_message ? `<pre>${escapeHtml(job.error_message)}</pre>` : ""}
-            ${
-              job.status === "failed"
-                ? `<div class="item-actions"><button data-retry="${escapeHtml(job.id)}">重试</button></div>`
-                : ""
-            }
-          </article>
-        `,
-      )
-      .join("") || `<div class="muted">暂无异步任务</div>`;
-
-  document.querySelectorAll("[data-retry]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await api(`/api/jobs/${button.dataset.retry}/retry`, { method: "POST" });
-      await refreshAll();
-    });
-  });
-}
-
-async function loadApprovals() {
-  const approvals = await api("/api/approvals?limit=20");
-  $("approvals").innerHTML =
-    approvals
-      .map(
-        (approval) => `
-          <article class="item">
-            <div class="item-title">
-              <strong>${escapeHtml(approval.tool_name)}</strong>
-              ${statusBadge(approval.status)}
-            </div>
-            <div class="muted">${escapeHtml(approval.id)}</div>
-            <pre>${escapeHtml(short(JSON.stringify(approval.payload, null, 2), 420))}</pre>
-            ${
-              approval.status === "pending"
-                ? `<div class="item-actions">
-                    <button data-approve="${escapeHtml(approval.id)}">通过</button>
-                    <button class="danger" data-deny="${escapeHtml(approval.id)}">拒绝</button>
-                  </div>`
-                : ""
-            }
-          </article>
-        `,
-      )
-      .join("") || `<div class="muted">暂无审批</div>`;
-
-  document.querySelectorAll("[data-approve]").forEach((button) => {
-    button.addEventListener("click", () => decide(button.dataset.approve, true));
-  });
-  document.querySelectorAll("[data-deny]").forEach((button) => {
-    button.addEventListener("click", () => decide(button.dataset.deny, false));
-  });
-}
-
-async function decide(approvalId, approved) {
-  await api(`/api/approvals/${approvalId}/decide`, {
-    method: "POST",
-    body: JSON.stringify({
-      approved,
-      decided_by: "manager",
-      reason: approved ? "演示审批通过" : "演示审批拒绝",
-    }),
-  });
-  await refreshAll();
-}
-
-async function loadArtifacts() {
-  const endpoint = {
-    tickets: "/api/tickets?limit=20",
-    emails: "/api/emails?limit=20",
-    knowledge: "/api/knowledge?limit=20",
-  }[state.activeTab];
-  const items = await api(endpoint);
-  $("artifacts").innerHTML =
-    items
-      .map((item) => {
-        if (state.activeTab === "tickets") {
-          return `<article class="item"><div class="item-title"><strong>${escapeHtml(item.title)}</strong>${statusBadge(item.status)}</div><div class="muted">${escapeHtml(item.id)} · ${escapeHtml(item.owner_department)}</div><pre>${escapeHtml(short(item.description, 320))}</pre></article>`;
-        }
-        if (state.activeTab === "emails") {
-          return `<article class="item"><div class="item-title"><strong>${escapeHtml(item.subject)}</strong>${statusBadge(item.status)}</div><div class="muted">${escapeHtml(item.to_address)}</div><pre>${escapeHtml(short(item.body, 320))}</pre></article>`;
-        }
-        return `<article class="item"><div class="item-title"><strong>${escapeHtml(item.title)}</strong><span class="status">${escapeHtml(item.category)}</span></div><div class="muted">${escapeHtml(item.tags)}</div><pre>${escapeHtml(short(item.content, 320))}</pre></article>`;
-      })
-      .join("") || `<div class="muted">暂无数据</div>`;
+function clearAuthenticatedViews() {
+  $("metrics").innerHTML = emptyState("请先登录");
+  $("recentRuns").innerHTML = emptyState("请先登录后查看处理状态");
+  $("approvals").innerHTML = emptyState("请先登录后查看审批");
+  $("artifacts").innerHTML = emptyState("请先登录后查看业务产物");
 }
 
 async function refreshAll() {
-  await loadMe();
+  await loadHealth();
+  const user = await loadMe();
+  if (!user) {
+    clearAuthenticatedViews();
+    return;
+  }
   await Promise.allSettled([
-    loadHealth(),
     loadMetrics(),
-    loadMultiAgentRuns(),
-    loadRuns(),
-    loadJobs(),
+    loadRecentRuns(),
     loadApprovals(),
     loadArtifacts(),
   ]);
 }
 
-$("runForm").addEventListener("submit", async (event) => {
-  event.preventDefault();
+async function loadMetrics() {
+  try {
+    const metrics = await api("/api/metrics/summary");
+    const totals = metrics.totals;
+    $("metrics").innerHTML = [
+      ["运行", totals.runs],
+      ["待审批", totals.pending_approvals],
+      ["工单", totals.tickets],
+      ["邮件", totals.emails],
+    ]
+      .map(([label, value]) => `<div class="metric"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`)
+      .join("");
+  } catch (error) {
+    $("metrics").innerHTML = emptyState(error.message);
+  }
+}
+
+async function loadRecentRuns() {
+  try {
+    const runs = await api("/api/multi-agent/runs?limit=6");
+    const details = [];
+    for (const run of runs.slice(0, 3)) {
+      details.push(await api(`/api/multi-agent/runs/${run.id}`));
+    }
+    $("recentRuns").innerHTML = details.map(renderRunSummary).join("") || emptyState("暂无处理记录");
+  } catch (error) {
+    $("recentRuns").innerHTML = emptyState(error.message);
+  }
+}
+
+function renderRunSummary(run) {
+  const agents = (run.messages || []).map((item) => item.agent_name).join(" → ");
+  return `
+    <article class="item">
+      <div class="item-title">
+        <strong>${escapeHtml(short(run.objective, 110))}</strong>
+        ${statusBadge(run.status)}
+      </div>
+      <div class="muted">workflow=${escapeHtml(run.workflow_run_id || "-")} · critic=${Number(run.critic_score || 0).toFixed(0)} · ${escapeHtml(run.latency_ms || 0)}ms</div>
+      <p class="summary-text">${escapeHtml(run.final_summary || "处理中")}</p>
+      <div class="timeline-line">${escapeHtml(agents || "等待调度")}</div>
+    </article>
+  `;
+}
+
+async function loadApprovals() {
+  if (!state.user || !["admin", "manager"].includes(state.user.role)) {
+    $("approvals").innerHTML = emptyState("当前账号没有审批权限");
+    return;
+  }
+  try {
+    const approvals = await api("/api/approvals?limit=20");
+    $("approvals").innerHTML = approvals.map(renderApproval).join("") || emptyState("暂无待处理审批");
+    bindApprovalButtons();
+  } catch (error) {
+    $("approvals").innerHTML = emptyState(error.message);
+  }
+}
+
+function renderApproval(approval) {
+  return `
+    <article class="item">
+      <div class="item-title">
+        <strong>${escapeHtml(approval.tool_name)}</strong>
+        ${statusBadge(approval.status)}
+      </div>
+      <div class="muted">${escapeHtml(approval.id)}</div>
+      <pre>${escapeHtml(short(JSON.stringify(approval.payload, null, 2), 440))}</pre>
+      ${
+        approval.status === "pending"
+          ? `<div class="button-row">
+              <button data-approve="${escapeHtml(approval.id)}">通过</button>
+              <button class="danger" data-deny="${escapeHtml(approval.id)}">拒绝</button>
+            </div>`
+          : ""
+      }
+    </article>
+  `;
+}
+
+function bindApprovalButtons() {
+  document.querySelectorAll("[data-approve]").forEach((button) => {
+    button.addEventListener("click", () => decide(button, button.dataset.approve, true));
+  });
+  document.querySelectorAll("[data-deny]").forEach((button) => {
+    button.addEventListener("click", () => decide(button, button.dataset.deny, false));
+  });
+}
+
+async function decide(button, approvalId, approved) {
+  await withButton(button, "处理中...", async () => {
+    await api(`/api/approvals/${approvalId}/decide`, {
+      method: "POST",
+      body: JSON.stringify({
+        approved,
+        decided_by: state.user?.id || "manager",
+        reason: approved ? "审批通过" : "审批拒绝",
+      }),
+    });
+    showMessage(approved ? "审批已通过" : "审批已拒绝", "ok");
+    await refreshAll();
+  }).catch((error) => showMessage(error.message, "bad"));
+}
+
+async function loadArtifacts() {
+  try {
+    const endpoint = {
+      tickets: "/api/tickets?limit=20",
+      emails: "/api/emails?limit=20",
+      knowledge: "/api/knowledge?limit=20",
+    }[state.activeTab];
+    const items = await api(endpoint);
+    $("artifacts").innerHTML = items.map(renderArtifact).join("") || emptyState("暂无数据");
+  } catch (error) {
+    $("artifacts").innerHTML = emptyState(error.message);
+  }
+}
+
+function renderArtifact(item) {
+  if (state.activeTab === "tickets") {
+    return `<article class="item"><div class="item-title"><strong>${escapeHtml(item.title)}</strong>${statusBadge(item.status)}</div><div class="muted">${escapeHtml(item.id)} · ${escapeHtml(item.owner_department)}</div><p class="summary-text">${escapeHtml(short(item.description, 320))}</p></article>`;
+  }
+  if (state.activeTab === "emails") {
+    return `<article class="item"><div class="item-title"><strong>${escapeHtml(item.subject)}</strong>${statusBadge(item.status)}</div><div class="muted">${escapeHtml(item.to_address)}</div><p class="summary-text">${escapeHtml(short(item.body, 320))}</p></article>`;
+  }
+  return `<article class="item"><div class="item-title"><strong>${escapeHtml(item.title)}</strong><span class="status">${escapeHtml(item.category)}</span></div><div class="muted">${escapeHtml(item.tags)}</div><p class="summary-text">${escapeHtml(short(item.content, 320))}</p></article>`;
+}
+
+function emptyState(text) {
+  return `<div class="empty-state">${escapeHtml(text)}</div>`;
+}
+
+async function login(button) {
+  await withButton(button, "登录中...", async () => {
+    const result = await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({
+        user_id: $("loginUser").value.trim(),
+        password: $("loginPassword").value,
+      }),
+      headers: {},
+    });
+    localStorage.setItem("agent_access_token", result.access_token);
+    showMessage("登录成功", "ok");
+    await refreshAll();
+  }).catch((error) => showMessage(error.message, "bad"));
+}
+
+async function submitRun(button, mode) {
   const payload = formPayload();
-  if (!payload.objective) return;
-  await api("/api/workflow/run", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  $("objective").value = "";
-  await refreshAll();
-});
+  if (!payload.objective) {
+    showMessage("请输入业务请求", "warn");
+    return;
+  }
+  const endpoint = mode === "queue" ? "/api/workflow/jobs" : "/api/multi-agent/run";
+  const label = mode === "queue" ? "入队中..." : "处理中...";
+  await withButton(button, label, async () => {
+    await api(endpoint, { method: "POST", body: JSON.stringify(payload) });
+    $("objective").value = "";
+    showMessage(mode === "queue" ? "请求已加入异步队列" : "请求已处理完成", "ok");
+    await refreshAll();
+  }).catch((error) => showMessage(error.message, "bad"));
+}
 
-$("multiAgentBtn").addEventListener("click", async () => {
-  const payload = formPayload();
-  if (!payload.objective) return;
-  await api("/api/multi-agent/run", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  $("objective").value = "";
-  await refreshAll();
-});
-
-$("enqueueBtn").addEventListener("click", async () => {
-  const payload = formPayload();
-  if (!payload.objective) return;
-  await api("/api/workflow/jobs", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  $("objective").value = "";
-  await refreshAll();
-});
-
-$("refreshBtn").addEventListener("click", refreshAll);
-$("loginBtn").addEventListener("click", async () => {
-  const result = await api("/api/auth/login", {
-    method: "POST",
-    body: JSON.stringify({
-      user_id: $("loginUser").value.trim(),
-      password: $("loginPassword").value,
-    }),
-    headers: {},
-  });
-  localStorage.setItem("agent_access_token", result.access_token);
-  await refreshAll();
-});
-
+$("runForm").addEventListener("submit", (event) => event.preventDefault());
+$("loginBtn").addEventListener("click", (event) => login(event.currentTarget));
 $("logoutBtn").addEventListener("click", async () => {
-  localStorage.removeItem("agent_access_token");
-  await refreshAll();
+  await logoutCurrentUser();
+  state.user = null;
+  $("me").textContent = "未登录";
+  showMessage("已退出", "ok");
+  clearAuthenticatedViews();
 });
-
-$("seedBtn").addEventListener("click", async () => {
-  await api("/api/admin/seed?reset=true", { method: "POST" });
-  await refreshAll();
-});
+$("multiAgentBtn").addEventListener("click", (event) => submitRun(event.currentTarget, "run"));
+$("enqueueBtn").addEventListener("click", (event) => submitRun(event.currentTarget, "queue"));
+$("refreshBtn").addEventListener("click", (event) => withButton(event.currentTarget, "刷新中...", refreshAll));
 
 document.querySelectorAll(".tab").forEach((button) => {
   button.addEventListener("click", async () => {
@@ -368,6 +314,4 @@ document.querySelectorAll(".tab").forEach((button) => {
   });
 });
 
-refreshAll().catch((error) => {
-  $("health").textContent = error.message;
-});
+refreshAll();

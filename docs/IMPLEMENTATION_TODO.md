@@ -30,7 +30,7 @@
 - [x] `golden_traces`：可复用的黄金轨迹
 - [x] `trace_replays`：历史 run 重放和 diff 报告
 - [ ] PostgreSQL + Alembic 迁移
-- [ ] tenant_id / workspace_id 多租户字段
+- [x] tenant_id / workspace_id 多租户字段
 
 ## Phase 2：单 Agent Workflow
 

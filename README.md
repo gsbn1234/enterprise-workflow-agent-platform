@@ -33,7 +33,7 @@
 - Agent harness：对多智能体轨迹做批量评测，覆盖 expected agents、critic score、workflow status、approval accuracy
 - 审计与指标：workflow、ticket、email、approval、MCP tool call、多智能体 run 均写入审计/指标/评测报告
 - 管理台 UI：发起单 Agent / 多智能体运行，查看多智能体轨迹、workflow trace、审批、job、指标、业务产物
-- Docker Compose：Web + Worker 双服务启动
+- Docker Compose：本地 Web + Worker 双服务启动；HR Demo 版可一键启动 Agent、Worker、RAG、pgvector 和外部工单系统
 
 ## 目录结构
 
@@ -75,7 +75,35 @@ docs/
   MULTI_AGENT_TODO.md             前沿多智能体增强路线图
   AGENT_BUILD_JOURNEY.md          实现过程与设计说明
   DOCKER_DEPLOYMENT.md            Docker 部署说明
+  HR_DEMO_GUIDE.md                HR 试用部署与演示指南
 ```
+
+## HR 完整试用部署
+
+如果要给 HR 一个可以直接打开的完整版试用环境，使用：
+
+```powershell
+Copy-Item .env.hr-demo.example .env.hr-demo
+docker compose --env-file .env.hr-demo -f docker-compose.prod.yml up --build -d
+```
+
+它会启动：
+
+```text
+Agent 用户端/后台端   http://127.0.0.1:8010
+外部工单系统          http://127.0.0.1:8020
+RAG 知识库            http://127.0.0.1:8000
+PostgreSQL + pgvector 127.0.0.1:5432
+Agent Worker          后台队列执行
+```
+
+云服务器部署前，请先编辑 `.env.hr-demo` 中的密钥和：
+
+```text
+TICKET_SERVICE_PUBLIC_BASE_URL=http://你的服务器IP:8020
+```
+
+完整说明见 [docs/HR_DEMO_GUIDE.md](docs/HR_DEMO_GUIDE.md)。
 
 ## 本地启动
 
@@ -115,6 +143,69 @@ AGENT_AUTH_REQUIRED=false
 AGENT_AUTH_REQUIRED=true
 AGENT_AUTH_TOKEN_SECRET=replace-with-random-secret
 ```
+
+## 接入真实邮件和工单
+
+默认 `AGENT_TOOL_MODE=mock`，邮件和工单只写入本地数据库，适合演示和面试。要执行真实外部动作，改 `.env`：
+
+```text
+AGENT_TOOL_MODE=real
+AGENT_AUTH_REQUIRED=true
+AGENT_EXTERNAL_EMAIL_REQUIRES_APPROVAL=true
+```
+
+真实邮件使用 SMTP。真实发送前必须配置白名单，避免误发：
+
+```text
+AGENT_EMAIL_PROVIDER=smtp
+AGENT_EMAIL_ALLOWLIST=your-test@example.com,@your-company.com
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=your-smtp-user@example.com
+SMTP_PASSWORD=your-smtp-app-password
+SMTP_FROM_EMAIL=your-smtp-user@example.com
+SMTP_USE_TLS=true
+SMTP_USE_SSL=false
+```
+
+真实工单可接通用 HTTP API：
+
+```text
+AGENT_TICKET_PROVIDER=http
+TICKET_API_URL=https://ticket.example.com/api/tickets
+TICKET_API_TOKEN=replace-with-token
+TICKET_HTTP_ID_FIELD=id
+TICKET_HTTP_URL_FIELD=url
+```
+
+如果没有第三方工单系统，本项目内置了一个本地“外部工单系统”，用于演示真实跨服务调用。它独立运行在 `http://127.0.0.1:8020`，数据写入 `data/external_ticket_service.sqlite3`：
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn external_ticket_service.server:app --host 127.0.0.1 --port 8020
+```
+
+Agent 侧配置：
+
+```text
+AGENT_TOOL_MODE=real
+AGENT_TICKET_PROVIDER=http
+TICKET_API_URL=http://127.0.0.1:8020/api/tickets
+TICKET_HTTP_ID_FIELD=id
+TICKET_HTTP_URL_FIELD=url
+```
+
+也可接 Jira Cloud：
+
+```text
+AGENT_TICKET_PROVIDER=jira
+JIRA_BASE_URL=https://your-domain.atlassian.net
+JIRA_EMAIL=your-jira-email@example.com
+JIRA_API_TOKEN=replace-with-jira-api-token
+JIRA_PROJECT_KEY=OPS
+JIRA_ISSUE_TYPE=Task
+```
+
+真实创建成功后，`GET /api/tickets` 会返回 `provider`、`external_id`、`external_url`，后台「业务产物 → 工单」也会显示外部工单链接。真实邮件发送后，`GET /api/emails` 会返回 `provider`、`external_message_id`；失败会记录 `error_message` 并写入审计。
 
 ## Docker 启动
 

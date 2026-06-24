@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.db import get_connection, row_to_dict, rows_to_dicts
 from app.services.agent import get_run_detail
 from app.services.multi_agent.orchestrator import get_multi_agent_run, run_multi_agent
+from app.services.tenancy import effective_tenant_id
 from app.utils import json_dumps, json_loads, new_id, utc_now
 
 
@@ -32,6 +33,7 @@ def export_multi_agent_trace(run_id: str, *, include_payloads: bool = False) -> 
     workflow_steps = (workflow or {}).get("steps", [])
     trace = {
         "run_id": run["id"],
+        "tenant_id": run.get("tenant_id"),
         "objective": run["objective"],
         "status": run["status"],
         "executor_type": run.get("executor_type"),
@@ -76,6 +78,7 @@ def save_golden_trace(run_id: str, name: str) -> dict:
     trace = export_multi_agent_trace(run_id, include_payloads=False)
     if not trace:
         raise ValueError(f"Multi-agent run not found: {run_id}")
+    tenant = effective_tenant_id(trace.get("tenant_id"))
     now = utc_now()
     with get_connection() as conn:
         existing = conn.execute("SELECT * FROM golden_traces WHERE name = ?", (name,)).fetchone()
@@ -83,10 +86,10 @@ def save_golden_trace(run_id: str, name: str) -> dict:
             conn.execute(
                 """
                 UPDATE golden_traces
-                SET source_run_id = ?, trace_json = ?, created_at = ?
+                SET source_run_id = ?, tenant_id = ?, trace_json = ?, created_at = ?
                 WHERE id = ?
                 """,
-                (run_id, json_dumps(trace), now, existing["id"]),
+                (run_id, tenant, json_dumps(trace), now, existing["id"]),
             )
             golden_id = existing["id"]
         else:
@@ -94,24 +97,35 @@ def save_golden_trace(run_id: str, name: str) -> dict:
             conn.execute(
                 """
                 INSERT INTO golden_traces
-                (id, name, source_run_id, trace_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                (id, name, source_run_id, tenant_id, trace_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (golden_id, name, run_id, json_dumps(trace), now),
+                (golden_id, name, run_id, tenant, json_dumps(trace), now),
             )
     return get_golden_trace(golden_id)
 
 
-def list_golden_traces(limit: int = 100) -> list[dict]:
+def list_golden_traces(limit: int = 100, tenant_id: str | None = None) -> list[dict]:
     with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM golden_traces
-            ORDER BY created_at DESC, id DESC
-            LIMIT ?
-            """,
-            (max(1, min(limit, 500)),),
-        ).fetchall()
+        if tenant_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM golden_traces
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (tenant_id, max(1, min(limit, 500))),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM golden_traces
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, min(limit, 500)),),
+            ).fetchall()
     items = rows_to_dicts(rows)
     for item in items:
         item["trace"] = json_loads(item.pop("trace_json"), {})
@@ -156,6 +170,7 @@ def replay_multi_agent_run(source_run_id: str) -> dict:
         source["objective"],
         requester_user_id=source.get("requester_user_id"),
         requester_department=source.get("requester_department"),
+        tenant_id=source.get("tenant_id"),
         enable_self_correction=True,
         max_correction_attempts=max(1, int(source.get("correction_count") or 0)),
         replay_of_run_id=source_run_id,
@@ -168,10 +183,10 @@ def replay_multi_agent_run(source_run_id: str) -> dict:
         conn.execute(
             """
             INSERT INTO trace_replays
-            (id, source_run_id, replay_run_id, mode, status, diff_report_json, created_at, completed_at)
-            VALUES (?, ?, ?, 'full_replay', ?, ?, ?, ?)
+            (id, source_run_id, replay_run_id, mode, tenant_id, status, diff_report_json, created_at, completed_at)
+            VALUES (?, ?, ?, 'full_replay', ?, ?, ?, ?, ?)
             """,
-            (replay_id, source_run_id, replay["id"], status, json_dumps(diff), now, now),
+            (replay_id, source_run_id, replay["id"], effective_tenant_id(source.get("tenant_id")), status, json_dumps(diff), now, now),
         )
     return get_trace_replay(replay_id)
 
@@ -186,16 +201,27 @@ def get_trace_replay(replay_id: str) -> dict | None:
     return replay
 
 
-def list_trace_replays(limit: int = 100) -> list[dict]:
+def list_trace_replays(limit: int = 100, tenant_id: str | None = None) -> list[dict]:
     with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM trace_replays
-            ORDER BY created_at DESC, id DESC
-            LIMIT ?
-            """,
-            (max(1, min(limit, 500)),),
-        ).fetchall()
+        if tenant_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM trace_replays
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (tenant_id, max(1, min(limit, 500))),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM trace_replays
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, min(limit, 500)),),
+            ).fetchall()
     replays = rows_to_dicts(rows)
     for replay in replays:
         replay["diff_report"] = json_loads(replay.pop("diff_report_json"), {})

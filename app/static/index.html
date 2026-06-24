@@ -3,103 +3,101 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>企业多智能体 Agent 平台</title>
+    <title>业务请求工作台 · 企业 Agent 平台</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <header class="topbar">
-      <div>
-        <h1>企业多智能体 Agent 平台</h1>
+    <header class="app-header">
+      <div class="brand-block">
+        <h1>业务请求工作台</h1>
         <p id="health">连接中...</p>
       </div>
-      <div class="top-actions">
-        <input id="loginUser" class="login-input" placeholder="用户" value="admin" />
-        <input id="loginPassword" class="login-input" type="password" placeholder="密码" value="AdminPass123" />
-        <button id="loginBtn" type="button">登录</button>
-        <button id="logoutBtn" class="secondary" type="button">退出</button>
-        <span id="me" class="me-label"></span>
-        <button id="refreshBtn" type="button">刷新</button>
-        <button id="seedBtn" type="button">重置演示数据</button>
-      </div>
+      <nav class="header-actions" aria-label="页面导航">
+        <a class="nav-link" href="/admin">后台控制台</a>
+      </nav>
     </header>
 
-    <main class="workspace">
-      <section class="panel input-panel">
-        <div class="panel-heading">
-          <h2>发起任务</h2>
-          <span>Run</span>
-        </div>
-        <form id="runForm">
-          <label for="objective">业务请求</label>
-          <textarea
-            id="objective"
-            name="objective"
-            rows="8"
-            placeholder="例如：客户 Orbit Retail 投诉上月服务中断，要求退款 800 元，请创建工单并准备回复 support@orbit.example"
-          ></textarea>
-          <div class="form-row">
-            <input id="requester" placeholder="发起人" value="alice" />
-            <input id="department" placeholder="部门" value="Customer Success" />
+    <main class="page-shell">
+      <aside class="sidebar">
+        <section class="panel auth-panel">
+          <div class="panel-heading">
+            <h2>登录</h2>
+            <span id="me" class="state-pill">未登录</span>
           </div>
-          <div class="item-actions">
-            <button id="multiAgentBtn" type="button">多智能体运行</button>
-            <button type="submit" class="secondary">单 Agent 同步</button>
-            <button id="enqueueBtn" class="secondary" type="button">入队执行</button>
+          <div class="stack">
+            <input id="loginUser" class="input" autocomplete="username" placeholder="用户" value="admin" />
+            <input id="loginPassword" class="input" type="password" autocomplete="current-password" placeholder="密码" value="AdminPass123" />
+            <div class="button-row">
+              <button id="loginBtn" type="button">登录</button>
+              <button id="logoutBtn" class="secondary" type="button">退出</button>
+            </div>
           </div>
-        </form>
-      </section>
+          <div id="message" class="message" role="status"></div>
+        </section>
 
-      <section class="panel">
-        <div class="panel-heading">
-          <h2>指标</h2>
-          <span>Ops</span>
-        </div>
-        <div id="metrics" class="metric-grid"></div>
-      </section>
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>状态概览</h2>
+            <span>Today</span>
+          </div>
+          <div id="metrics" class="metric-grid compact"></div>
+        </section>
+      </aside>
 
-      <section class="panel wide">
-        <div class="panel-heading">
-          <h2>多智能体轨迹</h2>
-          <span>Agent Harness</span>
-        </div>
-        <div id="multiAgentRuns" class="multi-agent-list"></div>
-      </section>
+      <section class="content-grid">
+        <section class="panel request-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>提交业务请求</h2>
+              <p class="subtext">输入自然语言请求，Agent 会自动规划、查询知识、判断审批并生成处理产物。</p>
+            </div>
+          </div>
+          <form id="runForm" class="stack">
+            <textarea
+              id="objective"
+              name="objective"
+              rows="7"
+              placeholder="例如：客户 Orbit Retail 投诉上月服务中断，要求退费 800 元，请创建工单并准备回复 support@orbit.example"
+            ></textarea>
+            <div class="form-row">
+              <input id="requester" class="input" placeholder="发起人" value="alice" />
+              <input id="department" class="input" placeholder="部门" value="Customer Success" />
+            </div>
+            <div class="button-row">
+              <button id="multiAgentBtn" type="button">提交并处理</button>
+              <button id="enqueueBtn" class="secondary" type="button">加入异步队列</button>
+              <button id="refreshBtn" class="secondary" type="button">刷新</button>
+            </div>
+          </form>
+        </section>
 
-      <section class="panel wide">
-        <div class="panel-heading">
-          <h2>工作流轨迹</h2>
-          <span>Trace</span>
-        </div>
-        <div id="runs" class="run-list"></div>
-      </section>
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>最近处理</h2>
+            <span>Runs</span>
+          </div>
+          <div id="recentRuns" class="item-list"></div>
+        </section>
 
-      <section class="panel">
-        <div class="panel-heading">
-          <h2>异步任务</h2>
-          <span>Jobs</span>
-        </div>
-        <div id="jobs" class="job-list"></div>
-      </section>
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>待处理审批</h2>
+            <span>HITL</span>
+          </div>
+          <div id="approvals" class="item-list"></div>
+        </section>
 
-      <section class="panel">
-        <div class="panel-heading">
-          <h2>审批</h2>
-          <span>HITL</span>
-        </div>
-        <div id="approvals" class="approval-list"></div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-heading">
-          <h2>业务产物</h2>
-          <span>Tools</span>
-        </div>
-        <div class="tabs">
-          <button class="tab active" data-tab="tickets">工单</button>
-          <button class="tab" data-tab="emails">邮件</button>
-          <button class="tab" data-tab="knowledge">知识</button>
-        </div>
-        <div id="artifacts" class="artifact-list"></div>
+        <section class="panel wide-panel">
+          <div class="panel-heading">
+            <h2>处理结果</h2>
+            <div class="tabs" role="tablist" aria-label="业务产物">
+              <button class="tab active" type="button" data-tab="tickets">工单</button>
+              <button class="tab" type="button" data-tab="emails">邮件</button>
+              <button class="tab" type="button" data-tab="knowledge">知识依据</button>
+            </div>
+          </div>
+          <div id="artifacts" class="item-list artifact-list"></div>
+        </section>
       </section>
     </main>
 

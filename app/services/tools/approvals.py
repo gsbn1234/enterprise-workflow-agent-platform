@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.db import get_connection, row_to_dict, rows_to_dicts
 from app.services.audit import record_audit
+from app.services.tenancy import effective_tenant_id
 from app.utils import json_dumps, json_loads, new_id, utc_now
 
 
@@ -12,18 +13,20 @@ def create_approval(
     payload: dict,
     *,
     requested_by: str = "agent",
+    tenant_id: str | None = None,
 ) -> dict:
     approval_id = new_id("approval")
+    tenant = effective_tenant_id(tenant_id)
     with get_connection() as conn:
         conn.execute(
             """
             INSERT INTO approvals
-            (id, run_id, action_type, tool_name, payload_json, status, requested_by, created_at)
-            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+            (id, run_id, action_type, tool_name, payload_json, tenant_id, status, requested_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
-            (approval_id, run_id, action_type, tool_name, json_dumps(payload), requested_by, utc_now()),
+            (approval_id, run_id, action_type, tool_name, json_dumps(payload), tenant, requested_by, utc_now()),
         )
-    record_audit("approval.request", "approval", approval_id, {"run_id": run_id, "tool_name": tool_name})
+    record_audit("approval.request", "approval", approval_id, {"run_id": run_id, "tool_name": tool_name}, tenant_id=tenant)
     return get_approval(approval_id)
 
 
@@ -36,9 +39,19 @@ def get_approval(approval_id: str) -> dict | None:
     return approval
 
 
-def list_approvals(status: str | None = None, limit: int = 100) -> list[dict]:
+def list_approvals(status: str | None = None, limit: int = 100, tenant_id: str | None = None) -> list[dict]:
     with get_connection() as conn:
-        if status:
+        if status and tenant_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM approvals
+                WHERE status = ? AND tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (status, tenant_id, max(1, min(limit, 500))),
+            ).fetchall()
+        elif status:
             rows = conn.execute(
                 """
                 SELECT * FROM approvals
@@ -47,6 +60,16 @@ def list_approvals(status: str | None = None, limit: int = 100) -> list[dict]:
                 LIMIT ?
                 """,
                 (status, max(1, min(limit, 500))),
+            ).fetchall()
+        elif tenant_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM approvals
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (tenant_id, max(1, min(limit, 500))),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -79,5 +102,12 @@ def mark_approval(approval_id: str, approved: bool, decided_by: str, reason: str
             """,
             (status, decided_by, reason, utc_now(), approval_id),
         )
-    record_audit("approval.decide", "approval", approval_id, {"approved": approved, "reason": reason}, actor=decided_by)
+    record_audit(
+        "approval.decide",
+        "approval",
+        approval_id,
+        {"approved": approved, "reason": reason},
+        actor=decided_by,
+        tenant_id=row_to_dict(current).get("tenant_id"),
+    )
     return get_approval(approval_id)

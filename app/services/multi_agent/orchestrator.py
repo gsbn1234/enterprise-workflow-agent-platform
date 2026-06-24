@@ -14,6 +14,7 @@ from app.services.multi_agent.agents import (
     SupervisorAgent,
     ToolExecutionAgent,
 )
+from app.services.tenancy import effective_tenant_id
 from app.utils import json_dumps, json_loads, new_id, utc_now
 
 
@@ -23,6 +24,7 @@ def run_multi_agent(
     requester_user_id: str | None = None,
     requester_department: str | None = None,
     requester_role: str | None = None,
+    tenant_id: str | None = None,
     enable_self_correction: bool = True,
     max_correction_attempts: int = 1,
     replay_of_run_id: str | None = None,
@@ -35,6 +37,7 @@ def run_multi_agent(
         requester_user_id=requester_user_id,
         requester_department=requester_department,
         requester_role=requester_role,
+        tenant_id=tenant_id,
         enable_self_correction=enable_self_correction,
         max_correction_attempts=max_correction_attempts,
         replay_of_run_id=replay_of_run_id,
@@ -48,19 +51,28 @@ def run_multi_agent_legacy(
     requester_user_id: str | None = None,
     requester_department: str | None = None,
     requester_role: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict:
     started = time.perf_counter()
     run_id = new_id("ma")
+    tenant = effective_tenant_id(tenant_id)
     with get_connection() as conn:
         conn.execute(
             """
             INSERT INTO multi_agent_runs
-            (id, objective, requester_user_id, requester_department, status, created_at)
-            VALUES (?, ?, ?, ?, 'running', ?)
+            (id, objective, requester_user_id, requester_department, tenant_id, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'running', ?)
             """,
-            (run_id, objective, requester_user_id, requester_department, utc_now()),
+            (run_id, objective, requester_user_id, requester_department, tenant, utc_now()),
         )
-    record_audit("multi_agent.start", "multi_agent_run", run_id, {"requester": requester_user_id}, actor=requester_user_id or "agent")
+    record_audit(
+        "multi_agent.start",
+        "multi_agent_run",
+        run_id,
+        {"requester": requester_user_id},
+        actor=requester_user_id or "agent",
+        tenant_id=tenant,
+    )
 
     supervisor = SupervisorAgent()
     rag = RagResearchAgent()
@@ -70,7 +82,7 @@ def run_multi_agent_legacy(
     memory = MemoryAgent()
 
     try:
-        memory_context = _run_agent_message(run_id, memory.name, "context", lambda: memory.retrieve(objective))
+        memory_context = _run_agent_message(run_id, memory.name, "context", lambda: memory.retrieve(objective, tenant_id=tenant))
         supervisor_output = _run_agent_message(run_id, supervisor.name, "planner", lambda: supervisor.run(objective))
         research_output = _run_agent_message(
             run_id,
@@ -102,6 +114,8 @@ def run_multi_agent_legacy(
                 objective,
                 requester_user_id=requester_user_id,
                 requester_department=requester_department,
+                requester_role=requester_role,
+                tenant_id=tenant,
             ),
         )
         workflow_run_id = execution_output["workflow_run_id"]
@@ -115,7 +129,7 @@ def run_multi_agent_legacy(
             run_id,
             memory.name,
             "memory_writer",
-            lambda: memory.write(run_id, objective, critic_report, workflow_run_id),
+            lambda: memory.write(run_id, objective, critic_report, workflow_run_id, tenant_id=tenant),
         )
         final_summary = _final_summary(supervisor_output, risk_output, execution_output, critic_report, memory_context)
         latency_ms = int((time.perf_counter() - started) * 1000)
@@ -144,7 +158,14 @@ def run_multi_agent_legacy(
                     run_id,
                 ),
             )
-        record_audit("multi_agent.complete", "multi_agent_run", run_id, {"score": critic_report.get("score")}, actor=requester_user_id or "agent")
+        record_audit(
+            "multi_agent.complete",
+            "multi_agent_run",
+            run_id,
+            {"score": critic_report.get("score")},
+            actor=requester_user_id or "agent",
+            tenant_id=tenant,
+        )
     except Exception as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         failure_report = {"score": 0, "passed": False, "findings": [{"severity": "critical", "code": "multi_agent_failed", "message": str(exc)}]}
@@ -162,20 +183,38 @@ def run_multi_agent_legacy(
                 """,
                 (str(exc), json_dumps(failure_report), latency_ms, utc_now(), run_id),
             )
-        record_audit("multi_agent.failed", "multi_agent_run", run_id, {"error": str(exc)}, actor=requester_user_id or "agent")
+        record_audit(
+            "multi_agent.failed",
+            "multi_agent_run",
+            run_id,
+            {"error": str(exc)},
+            actor=requester_user_id or "agent",
+            tenant_id=tenant,
+        )
     return get_multi_agent_run(run_id)
 
 
-def list_multi_agent_runs(limit: int = 100) -> list[dict]:
+def list_multi_agent_runs(limit: int = 100, tenant_id: str | None = None) -> list[dict]:
     with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM multi_agent_runs
-            ORDER BY created_at DESC, id DESC
-            LIMIT ?
-            """,
-            (max(1, min(limit, 500)),),
-        ).fetchall()
+        if tenant_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM multi_agent_runs
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (tenant_id, max(1, min(limit, 500))),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM multi_agent_runs
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, min(limit, 500)),),
+            ).fetchall()
     runs = rows_to_dicts(rows)
     for run in runs:
         run["critic_report"] = json_loads(run.pop("critic_report_json"), {})
@@ -189,7 +228,7 @@ def get_multi_agent_run(run_id: str) -> dict | None:
             """
             SELECT * FROM multi_agent_messages
             WHERE run_id = ?
-            ORDER BY rowid ASC
+            ORDER BY created_at ASC, id ASC
             """,
             (run_id,),
         ).fetchall()

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>后台控制台 · 企业 Agent 平台</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand-block">
+        <h1>后台控制台</h1>
+        <p id="health">连接中...</p>
+      </div>
+      <nav class="header-actions" aria-label="页面导航">
+        <a class="nav-link" href="/">用户工作台</a>
+      </nav>
+    </header>
+
+    <main class="admin-shell">
+      <section class="panel admin-toolbar">
+        <div class="toolbar-grid">
+          <input id="loginUser" class="input" autocomplete="username" placeholder="用户" value="admin" />
+          <input id="loginPassword" class="input" type="password" autocomplete="current-password" placeholder="密码" value="AdminPass123" />
+          <button id="loginBtn" type="button">登录</button>
+          <button id="logoutBtn" class="secondary" type="button">退出</button>
+          <button id="refreshBtn" class="secondary" type="button">刷新</button>
+          <button id="ragCheckBtn" class="secondary" type="button">检查 RAG</button>
+          <button id="clearHistoryBtn" class="secondary" type="button">清理轨迹</button>
+          <button id="seedBtn" class="danger" type="button">重置数据</button>
+        </div>
+        <div class="toolbar-status">
+          <span id="me" class="state-pill">未登录</span>
+          <span id="message" class="message" role="status"></span>
+        </div>
+      </section>
+
+      <section class="admin-grid">
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>运行指标</h2>
+            <span>Ops</span>
+          </div>
+          <div id="metrics" class="metric-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>审批队列</h2>
+            <span>HITL</span>
+          </div>
+          <div id="approvals" class="item-list compact-list"></div>
+        </section>
+
+        <section class="panel wide-panel">
+          <div class="panel-heading">
+            <h2>多智能体轨迹</h2>
+            <span>Agent Trace</span>
+          </div>
+          <div id="multiAgentRuns" class="item-list trace-list"></div>
+        </section>
+
+        <section class="panel wide-panel">
+          <div class="panel-heading">
+            <h2>工作流轨迹</h2>
+            <span>Workflow</span>
+          </div>
+          <div id="runs" class="item-list trace-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>异步任务</h2>
+            <span>Jobs</span>
+          </div>
+          <div id="jobs" class="item-list compact-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>用户</h2>
+            <span>Accounts</span>
+          </div>
+          <div id="users" class="item-list compact-list"></div>
+        </section>
+
+        <section class="panel wide-panel">
+          <div class="panel-heading">
+            <h2>业务产物</h2>
+            <div class="tabs" role="tablist" aria-label="业务产物">
+              <button class="tab active" type="button" data-tab="tickets">工单</button>
+              <button class="tab" type="button" data-tab="emails">邮件</button>
+              <button class="tab" type="button" data-tab="knowledge">知识</button>
+              <button class="tab" type="button" data-tab="audit">审计</button>
+            </div>
+          </div>
+          <div id="artifacts" class="item-list artifact-list"></div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/admin.js"></script>
+  </body>
+</html>

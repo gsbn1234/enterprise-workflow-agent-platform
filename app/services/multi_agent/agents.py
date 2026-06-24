@@ -58,12 +58,16 @@ class RiskApprovalAgent:
             warnings.append("human_approval_required")
         if not research_output["enterprise_rag"].get("available"):
             warnings.append("enterprise_rag_unavailable")
-        if plan["category"] in {"security", "refund", "procurement"}:
+        if plan["category"] in {"security", "access_request", "refund", "procurement"}:
             warnings.append("sensitive_business_category")
+        if plan.get("approval_chain"):
+            warnings.append(f"approval_chain:{'->'.join(plan['approval_chain'])}")
         return {
             "risk_level": plan["risk_level"],
             "needs_approval": plan["needs_approval"],
             "category": plan["category"],
+            "workflow_type": plan.get("workflow_type"),
+            "blocked_actions": plan.get("blocked_actions", []),
             "warnings": warnings,
             "decision": "pause_for_approval" if plan["needs_approval"] else "auto_execute",
         }
@@ -78,11 +82,15 @@ class ToolExecutionAgent:
         *,
         requester_user_id: str | None = None,
         requester_department: str | None = None,
+        requester_role: str | None = None,
+        tenant_id: str | None = None,
     ) -> dict:
         workflow = run_workflow(
             objective,
             requester_user_id=requester_user_id,
             requester_department=requester_department,
+            requester_role=requester_role,
+            tenant_id=tenant_id,
         )
         return {
             "workflow_run_id": workflow["id"],
@@ -104,18 +112,35 @@ class CriticAgent:
         findings = []
         score = 100
 
-        if "query_enterprise_rag" not in tools:
-            findings.append({"severity": "high", "code": "missing_rag_tool", "message": "RAG tool was not called."})
-            score -= 25
-        if "create_ticket" not in tools:
-            findings.append({"severity": "high", "code": "missing_ticket", "message": "No operational ticket was created."})
-            score -= 25
+        category = supervisor_output["plan"].get("category")
+        if category == "ticket_query":
+            if "query_tickets" not in tools:
+                findings.append({"severity": "high", "code": "missing_ticket_query", "message": "Ticket query tool was not called."})
+                score -= 25
+        elif category == "ticket_update":
+            if "update_ticket" not in tools:
+                findings.append({"severity": "high", "code": "missing_ticket_update", "message": "Ticket update tool was not called."})
+                score -= 25
+        else:
+            if "query_enterprise_rag" not in tools:
+                findings.append({"severity": "high", "code": "missing_rag_tool", "message": "RAG tool was not called."})
+                score -= 25
+            waiting_for_approval = bool(supervisor_output["plan"].get("needs_approval")) and workflow.get("status") == "waiting_approval"
+            if "create_ticket" not in tools and not waiting_for_approval:
+                findings.append({"severity": "high", "code": "missing_ticket", "message": "No operational ticket was created."})
+                score -= 25
         if supervisor_output["plan"]["needs_approval"] and workflow.get("status") not in {"waiting_approval", "completed"}:
             findings.append({"severity": "high", "code": "approval_state_wrong", "message": "Risky workflow did not pause or complete through approval path."})
             score -= 20
         if risk_output and risk_output["needs_approval"] and "request_approval" not in tools:
             findings.append({"severity": "medium", "code": "missing_approval_tool", "message": "Risk agent expected approval but approval tool was not called."})
             score -= 15
+        if category in {"security", "access_request", "incident"} and "notify_internal_team" not in tools:
+            findings.append({"severity": "medium", "code": "missing_internal_notification", "message": "Security, access, or incident workflow should notify the responsible internal team."})
+            score -= 15
+        if category not in {"refund", "complaint", "communication"} and "send_email" in tools:
+            findings.append({"severity": "high", "code": "unexpected_external_email", "message": "Non-customer workflow sent an external email."})
+            score -= 25
         failed_steps = [step for step in steps if step.get("status") == "failed"]
         if failed_steps:
             findings.append({"severity": "medium", "code": "failed_steps", "message": f"{len(failed_steps)} step(s) failed."})
@@ -167,10 +192,18 @@ class CorrectionAgent:
 class MemoryAgent:
     name = "memory"
 
-    def retrieve(self, objective: str) -> dict:
-        return {"similar_cases": search_similar_memories(objective, limit=3)}
+    def retrieve(self, objective: str, *, tenant_id: str | None = None) -> dict:
+        return {"similar_cases": search_similar_memories(objective, limit=3, tenant_id=tenant_id)}
 
-    def write(self, multi_agent_run_id: str, objective: str, critic_report: dict, workflow_run_id: str) -> dict:
+    def write(
+        self,
+        multi_agent_run_id: str,
+        objective: str,
+        critic_report: dict,
+        workflow_run_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict:
         memory_type = "success_case" if critic_report.get("passed") else "failure_pattern"
         summary = f"{memory_type}: score={critic_report.get('score')} workflow={workflow_run_id}"
         return add_memory(
@@ -178,6 +211,7 @@ class MemoryAgent:
             memory_key=objective[:120],
             summary=summary,
             detail={"critic_report": critic_report, "workflow_run_id": workflow_run_id},
+            tenant_id=tenant_id,
             source_run_id=multi_agent_run_id,
             score=float(critic_report.get("score") or 0),
         )

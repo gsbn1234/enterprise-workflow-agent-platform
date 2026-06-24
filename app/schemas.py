@@ -10,6 +10,7 @@ class BusinessRequestCreate(BaseModel):
     description: str = Field(min_length=1)
     requester_user_id: str | None = None
     requester_department: str | None = None
+    tenant_id: str | None = None
     priority: str = "normal"
 
 
@@ -31,6 +32,7 @@ class UserCreate(BaseModel):
     department: str = Field(min_length=1, max_length=120)
     role: str = Field(pattern="^(admin|manager|employee)$")
     password: str = Field(min_length=8)
+    tenant_id: str | None = None
 
 
 class WorkflowRunRequest(BaseModel):
@@ -38,6 +40,8 @@ class WorkflowRunRequest(BaseModel):
     request_id: str | None = None
     requester_user_id: str | None = None
     requester_department: str | None = None
+    requester_role: str | None = None
+    tenant_id: str | None = None
 
 
 class MultiAgentRunRequest(BaseModel):
@@ -45,6 +49,7 @@ class MultiAgentRunRequest(BaseModel):
     requester_user_id: str | None = None
     requester_department: str | None = None
     requester_role: str | None = None
+    tenant_id: str | None = None
     enable_self_correction: bool = True
     max_correction_attempts: int = Field(default=1, ge=0, le=3)
 
@@ -69,6 +74,7 @@ class WorkflowJobCreate(BaseModel):
     request_id: str | None = None
     requester_user_id: str | None = None
     requester_department: str | None = None
+    tenant_id: str | None = None
     max_attempts: int | None = Field(default=None, ge=1, le=10)
 
 
@@ -76,6 +82,13 @@ class ApprovalDecisionRequest(BaseModel):
     approved: bool
     decided_by: str = "manager"
     reason: str | None = None
+
+
+class TicketOpsRequest(BaseModel):
+    status: str | None = None
+    owner_department: str | None = None
+    priority: str | None = None
+    comment: str | None = None
 
 
 class KnowledgeArticleCreate(BaseModel):

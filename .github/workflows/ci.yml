@@ -1,0 +1,93 @@
+name: agent-platform-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Python compile check
+        run: python -m compileall app scripts external_ticket_service
+
+      - name: Auth and RBAC smoke
+        run: python scripts/auth_smoke_test.py
+
+      - name: Login protection smoke
+        run: python scripts/security_smoke_test.py
+
+      - name: OIDC smoke
+        run: python scripts/oidc_smoke_test.py
+
+      - name: OIDC browser login smoke
+        run: python scripts/oidc_browser_smoke_test.py
+
+      - name: Tenant isolation smoke
+        run: python scripts/tenant_isolation_smoke_test.py
+
+      - name: Audit integrity smoke
+        run: python scripts/audit_integrity_smoke_test.py
+
+      - name: Prometheus metrics smoke
+        run: python scripts/metrics_smoke_test.py
+
+      - name: Trace context smoke
+        run: python scripts/trace_context_smoke_test.py
+
+      - name: Observability smoke
+        run: python scripts/observability_smoke_test.py
+
+      - name: Data retention smoke
+        run: python scripts/retention_smoke_test.py
+
+      - name: Tool retry smoke
+        run: python scripts/tool_retry_smoke_test.py
+
+      - name: Side-effect idempotency smoke
+        run: python scripts/idempotency_smoke_test.py
+
+      - name: Outbox retry smoke
+        run: python scripts/outbox_retry_smoke_test.py
+
+      - name: Outbox dispatcher smoke
+        run: python scripts/outbox_dispatcher_smoke_test.py
+
+      - name: Redis queue smoke
+        run: python scripts/queue_smoke_test.py
+
+      - name: Database backup and restore smoke
+        run: python scripts/db_backup_restore_smoke_test.py
+
+      - name: Migration and preflight
+        run: python scripts/migrate.py --seed --demo-users && python scripts/preflight.py
+
+      - name: PostgreSQL RLS smoke
+        run: python scripts/postgres_rls_smoke_test.py
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Docker compose config
+        run: docker compose config --quiet

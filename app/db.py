@@ -1,14 +1,177 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from app.config import settings
+from app.services.tenancy import current_rls_bypass, current_tenant_id, rls_system_context
 from app.utils import json_dumps, new_id, utc_now
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ModuleNotFoundError:  # pragma: no cover - optional until postgres is enabled
+    psycopg = None
+    dict_row = None
 
-def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
+
+BASELINE_MIGRATION_ID = "0001_enterprise_workflow_baseline"
+BASELINE_MIGRATION_DESCRIPTION = "Enterprise workflow agent baseline schema and indexes"
+IDEMPOTENCY_MIGRATION_ID = "0002_side_effect_idempotency"
+IDEMPOTENCY_MIGRATION_DESCRIPTION = "Add idempotency keys for tickets and emails"
+AUTH_SESSION_MIGRATION_ID = "0003_revocable_auth_sessions"
+AUTH_SESSION_MIGRATION_DESCRIPTION = "Add revocable access-token sessions"
+OUTBOX_MIGRATION_ID = "0004_external_outbox"
+OUTBOX_MIGRATION_DESCRIPTION = "Add external side-effect outbox"
+AUTH_LOGIN_PROTECTION_MIGRATION_ID = "0005_auth_login_protection"
+AUTH_LOGIN_PROTECTION_MIGRATION_DESCRIPTION = "Add login attempt audit and lockout controls"
+AUDIT_HASH_CHAIN_MIGRATION_ID = "0006_audit_hash_chain"
+AUDIT_HASH_CHAIN_MIGRATION_DESCRIPTION = "Add tamper-evident audit hash chain"
+TENANT_ISOLATION_MIGRATION_ID = "0007_tenant_isolation_foundation"
+TENANT_ISOLATION_MIGRATION_DESCRIPTION = "Add tenant identifiers to core business records"
+POSTGRES_RLS_MIGRATION_ID = "0008_postgres_tenant_rls"
+POSTGRES_RLS_MIGRATION_DESCRIPTION = "Add optional PostgreSQL row-level security for tenant-scoped records"
+POSTGRES_RLS_BYPASS_ROLE_MIGRATION_ID = "0009_postgres_rls_bypass_role_gate"
+POSTGRES_RLS_BYPASS_ROLE_MIGRATION_DESCRIPTION = "Gate PostgreSQL RLS bypass on an optional database role"
+WORKFLOW_RUN_TICKET_LINK_MIGRATION_ID = "0010_workflow_run_ticket_link"
+WORKFLOW_RUN_TICKET_LINK_MIGRATION_DESCRIPTION = "Store the primary ticket created by each workflow run"
+
+
+TENANT_RLS_TABLES = (
+    "business_requests",
+    "workflow_runs",
+    "workflow_jobs",
+    "multi_agent_runs",
+    "agent_memory",
+    "golden_traces",
+    "trace_replays",
+    "approvals",
+    "tickets",
+    "emails",
+    "external_outbox",
+    "audit_logs",
+)
+
+RELATED_RLS_TABLES = (
+    ("workflow_steps", "workflow_runs", "run_id"),
+    ("multi_agent_messages", "multi_agent_runs", "run_id"),
+    ("agent_checkpoints", "multi_agent_runs", "run_id"),
+)
+
+
+CONNECTION_PURPOSES = {"runtime", "migration", "worker", "readonly"}
+_connection_purpose: ContextVar[str] = ContextVar("database_connection_purpose", default="runtime")
+
+
+def normalize_connection_purpose(purpose: str | None) -> str:
+    normalized = (purpose or current_connection_purpose()).strip().lower()
+    if normalized not in CONNECTION_PURPOSES:
+        raise ValueError(f"Unknown database connection purpose: {purpose!r}.")
+    return normalized
+
+
+def current_connection_purpose() -> str:
+    return _connection_purpose.get()
+
+
+def set_connection_purpose(purpose: str):
+    return _connection_purpose.set(normalize_connection_purpose(purpose))
+
+
+def reset_connection_purpose(token) -> None:
+    _connection_purpose.reset(token)
+
+
+@contextmanager
+def database_connection_purpose(purpose: str) -> Iterator[None]:
+    token = set_connection_purpose(purpose)
+    try:
+        yield
+    finally:
+        reset_connection_purpose(token)
+
+
+def database_url_for_purpose(purpose: str | None = None) -> str:
+    normalized = normalize_connection_purpose(purpose)
+    urls = {
+        "migration": settings.migration_database_url,
+        "worker": settings.worker_database_url,
+        "readonly": settings.readonly_database_url,
+        "runtime": settings.database_url,
+    }
+    return urls.get(normalized) or settings.database_url
+
+
+def database_connection_profiles() -> dict[str, Any]:
+    return {
+        "runtime_configured": bool(settings.database_url),
+        "migration_configured": bool(settings.migration_database_url),
+        "worker_configured": bool(settings.worker_database_url),
+        "readonly_configured": bool(settings.readonly_database_url),
+        "current_purpose": current_connection_purpose(),
+    }
+
+
+class PostgresConnection:
+    backend = "postgres"
+
+    def __init__(self, dsn: str, schema: str, purpose: str = "runtime") -> None:
+        if psycopg is None or dict_row is None:
+            raise RuntimeError("psycopg is required for AGENT_DB_BACKEND=postgres. Run: pip install -r requirements.txt")
+        self.schema = clean_identifier(schema)
+        self.purpose = normalize_connection_purpose(purpose)
+        self._conn = psycopg.connect(dsn, row_factory=dict_row)
+        quoted_schema = quote_identifier(self.schema)
+        if self.purpose == "migration":
+            self._conn.execute(f"CREATE SCHEMA IF NOT EXISTS {quoted_schema}")
+        self._conn.execute(f"SET search_path TO {quoted_schema}")
+        if settings.postgres_rls_enabled:
+            self._conn.execute("SELECT set_config('app.tenant_id', %s, false)", (current_tenant_id(),))
+            self._conn.execute("SELECT set_config('app.rls_bypass', %s, false)", ("on" if current_rls_bypass() else "off",))
+            self._conn.execute("SELECT set_config('app.rls_bypass_role', %s, false)", (settings.postgres_rls_bypass_role,))
+        self._conn.commit()
+
+    def execute(self, sql: str, params: tuple[Any, ...] | list[Any] | None = None):
+        prepared_sql = translate_sqlite_placeholders(sql)
+        if prepared_sql.strip().upper() == "BEGIN IMMEDIATE":
+            prepared_sql = "BEGIN"
+        return self._conn.execute(prepared_sql, params)
+
+    def executescript(self, script: str) -> None:
+        for statement in split_sql_script(script):
+            self.execute(statement)
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> "PostgresConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type:
+            self.rollback()
+        else:
+            self.commit()
+        self.close()
+
+
+def get_connection(db_path: Path | None = None, *, purpose: str | None = None) -> sqlite3.Connection | PostgresConnection:
+    if db_path is None and settings.db_backend == "postgres":
+        normalized_purpose = normalize_connection_purpose(purpose)
+        dsn = database_url_for_purpose(purpose)
+        if not dsn:
+            raise RuntimeError("AGENT_DATABASE_URL is required when AGENT_DB_BACKEND=postgres.")
+        return PostgresConnection(dsn, settings.postgres_schema, purpose=normalized_purpose)
     path = db_path or settings.db_path
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -17,18 +180,21 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
-def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+def row_to_dict(row: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any] | None:
     if row is None:
         return None
+    if isinstance(row, dict):
+        return dict(row)
     return {key: row[key] for key in row.keys()}
 
 
-def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+def rows_to_dicts(rows: list[sqlite3.Row] | list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row_to_dict(row) for row in rows if row is not None]
 
 
 def init_db(seed: bool | None = None) -> None:
-    with get_connection() as conn:
+    with get_connection(purpose="migration") as conn:
+        _ensure_schema_migrations(conn)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS business_requests (
@@ -37,6 +203,7 @@ def init_db(seed: bool | None = None) -> None:
                 description TEXT NOT NULL,
                 requester_user_id TEXT,
                 requester_department TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 category TEXT,
                 priority TEXT NOT NULL DEFAULT 'normal',
                 status TEXT NOT NULL DEFAULT 'new',
@@ -49,10 +216,31 @@ def init_db(seed: bool | None = None) -> None:
                 display_name TEXT NOT NULL,
                 department TEXT NOT NULL,
                 role TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 password_hash TEXT NOT NULL,
                 disabled INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_login_attempts (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                success INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT,
+                ip_address TEXT,
+                user_agent TEXT,
+                lockout_until TEXT,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS workflow_runs (
@@ -62,6 +250,7 @@ def init_db(seed: bool | None = None) -> None:
                 status TEXT NOT NULL,
                 category TEXT,
                 risk_level TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 needs_approval INTEGER NOT NULL DEFAULT 0,
                 final_answer TEXT,
                 refusal_reason TEXT,
@@ -78,6 +267,7 @@ def init_db(seed: bool | None = None) -> None:
                 request_id TEXT,
                 requester_user_id TEXT,
                 requester_department TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 status TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 3,
@@ -117,6 +307,7 @@ def init_db(seed: bool | None = None) -> None:
                 objective TEXT NOT NULL,
                 requester_user_id TEXT,
                 requester_department TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 status TEXT NOT NULL,
                 workflow_run_id TEXT,
                 final_summary TEXT,
@@ -151,6 +342,7 @@ def init_db(seed: bool | None = None) -> None:
                 memory_key TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 detail_json TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 source_run_id TEXT,
                 score REAL NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
@@ -172,6 +364,7 @@ def init_db(seed: bool | None = None) -> None:
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
                 source_run_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 trace_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (source_run_id) REFERENCES multi_agent_runs(id)
@@ -182,6 +375,7 @@ def init_db(seed: bool | None = None) -> None:
                 source_run_id TEXT NOT NULL,
                 replay_run_id TEXT NOT NULL,
                 mode TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 status TEXT NOT NULL,
                 diff_report_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -196,6 +390,7 @@ def init_db(seed: bool | None = None) -> None:
                 action_type TEXT NOT NULL,
                 tool_name TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 status TEXT NOT NULL,
                 requested_by TEXT,
                 decided_by TEXT,
@@ -224,6 +419,12 @@ def init_db(seed: bool | None = None) -> None:
                 status TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 owner_department TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                provider TEXT NOT NULL DEFAULT 'mock',
+                external_id TEXT,
+                external_url TEXT,
+                idempotency_key TEXT,
+                external_payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (customer_id) REFERENCES customers(id)
@@ -234,10 +435,34 @@ def init_db(seed: bool | None = None) -> None:
                 to_address TEXT NOT NULL,
                 subject TEXT NOT NULL,
                 body TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 status TEXT NOT NULL,
                 approval_id TEXT,
+                provider TEXT NOT NULL DEFAULT 'mock',
+                external_message_id TEXT,
+                error_message TEXT,
+                idempotency_key TEXT,
                 created_at TEXT NOT NULL,
                 sent_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS external_outbox (
+                id TEXT PRIMARY KEY,
+                action_type TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                target_type TEXT,
+                target_id TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                idempotency_key TEXT,
+                status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                response_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                next_attempt_at TEXT,
+                completed_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS knowledge_articles (
@@ -257,7 +482,10 @@ def init_db(seed: bool | None = None) -> None:
                 event_type TEXT NOT NULL,
                 target_type TEXT NOT NULL,
                 target_id TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 detail_json TEXT NOT NULL,
+                previous_hash TEXT,
+                row_hash TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -275,6 +503,15 @@ def init_db(seed: bool | None = None) -> None:
             """
         )
         _ensure_column(conn, "workflow_steps", "attempt_count", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "business_requests", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "users", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "workflow_runs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "workflow_runs", "ticket_id", "TEXT")
+        _ensure_column(conn, "workflow_jobs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "approvals", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "tickets", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "emails", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "audit_logs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
         _ensure_column(conn, "workflow_steps", "max_attempts", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "workflow_steps", "retryable", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "workflow_steps", "error_type", "TEXT")
@@ -283,24 +520,432 @@ def init_db(seed: bool | None = None) -> None:
         _ensure_column(conn, "multi_agent_runs", "thread_id", "TEXT")
         _ensure_column(conn, "multi_agent_runs", "correction_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "multi_agent_runs", "replay_of_run_id", "TEXT")
+        _ensure_column(conn, "multi_agent_runs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "agent_memory", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "golden_traces", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "trace_replays", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "tickets", "provider", "TEXT NOT NULL DEFAULT 'mock'")
+        _ensure_column(conn, "tickets", "external_id", "TEXT")
+        _ensure_column(conn, "tickets", "external_url", "TEXT")
+        _ensure_column(conn, "tickets", "idempotency_key", "TEXT")
+        _ensure_column(conn, "tickets", "external_payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "emails", "provider", "TEXT NOT NULL DEFAULT 'mock'")
+        _ensure_column(conn, "emails", "external_message_id", "TEXT")
+        _ensure_column(conn, "emails", "error_message", "TEXT")
+        _ensure_column(conn, "emails", "idempotency_key", "TEXT")
+        _ensure_column(conn, "external_outbox", "target_type", "TEXT")
+        _ensure_column(conn, "external_outbox", "target_id", "TEXT")
+        _ensure_column(conn, "external_outbox", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "external_outbox", "idempotency_key", "TEXT")
+        _ensure_column(conn, "external_outbox", "next_attempt_at", "TEXT")
+        _ensure_column(conn, "external_outbox", "completed_at", "TEXT")
+        _ensure_column(conn, "auth_login_attempts", "ip_address", "TEXT")
+        _ensure_column(conn, "auth_login_attempts", "user_agent", "TEXT")
+        _ensure_column(conn, "auth_login_attempts", "lockout_until", "TEXT")
+        _ensure_column(conn, "audit_logs", "previous_hash", "TEXT")
+        _ensure_column(conn, "audit_logs", "row_hash", "TEXT")
+        _ensure_indexes(conn)
+        _ensure_postgres_rls(conn)
+        _record_schema_migration(conn, BASELINE_MIGRATION_ID, BASELINE_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, IDEMPOTENCY_MIGRATION_ID, IDEMPOTENCY_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, AUTH_SESSION_MIGRATION_ID, AUTH_SESSION_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, OUTBOX_MIGRATION_ID, OUTBOX_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, AUTH_LOGIN_PROTECTION_MIGRATION_ID, AUTH_LOGIN_PROTECTION_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, AUDIT_HASH_CHAIN_MIGRATION_ID, AUDIT_HASH_CHAIN_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, TENANT_ISOLATION_MIGRATION_ID, TENANT_ISOLATION_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, POSTGRES_RLS_MIGRATION_ID, POSTGRES_RLS_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, POSTGRES_RLS_BYPASS_ROLE_MIGRATION_ID, POSTGRES_RLS_BYPASS_ROLE_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, WORKFLOW_RUN_TICKET_LINK_MIGRATION_ID, WORKFLOW_RUN_TICKET_LINK_MIGRATION_DESCRIPTION)
     if settings.auto_seed if seed is None else seed:
-        seed_demo_data()
+        seed_demo_data(purpose="migration")
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+def database_status(*, purpose: str = "readonly") -> dict[str, Any]:
+    try:
+        with get_connection(purpose=purpose) as conn:
+            if settings.auto_migrate:
+                _ensure_schema_migrations(conn)
+            latest = conn.execute(
+                """
+                SELECT id, description, checksum, applied_at
+                FROM schema_migrations
+                ORDER BY applied_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            migrations = conn.execute("SELECT COUNT(*) AS count FROM schema_migrations").fetchone()
+            rls = postgres_rls_status(conn)
+        return {
+            "status": "ok",
+            "backend": settings.db_backend,
+            "sqlite_path": str(settings.db_path) if settings.db_backend == "sqlite" else None,
+            "postgres_schema": settings.postgres_schema if settings.db_backend == "postgres" else None,
+            "auto_migrate": settings.auto_migrate,
+            "connection_profiles": database_connection_profiles(),
+            "postgres_rls": rls,
+            "migration_count": int(migrations["count"]) if migrations else 0,
+            "latest_migration": row_to_dict(latest),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "backend": settings.db_backend,
+            "sqlite_path": str(settings.db_path) if settings.db_backend == "sqlite" else None,
+            "postgres_schema": settings.postgres_schema if settings.db_backend == "postgres" else None,
+            "auto_migrate": settings.auto_migrate,
+            "connection_profiles": database_connection_profiles(),
+            "postgres_rls": {
+                "enabled": settings.postgres_rls_enabled,
+                "bypass_role": settings.postgres_rls_bypass_role or None,
+            },
+            "error": str(exc),
+        }
+
+
+def list_schema_migrations(*, purpose: str = "readonly") -> list[dict[str, Any]]:
+    with get_connection(purpose=purpose) as conn:
+        if settings.auto_migrate:
+            _ensure_schema_migrations(conn)
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM schema_migrations
+            ORDER BY applied_at DESC, id DESC
+            """
+        ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def postgres_rls_status(conn: sqlite3.Connection | PostgresConnection | None = None) -> dict[str, Any]:
+    status = {
+        "enabled": settings.postgres_rls_enabled,
+        "bypass_role": settings.postgres_rls_bypass_role or None,
+        "role_gate_configured": bool(settings.postgres_rls_bypass_role),
+    }
+    if settings.db_backend != "postgres":
+        return status
+
+    owns_connection = conn is None
+    connection = conn or get_connection(purpose="readonly")
+    try:
+        role = settings.postgres_rls_bypass_role
+        if role:
+            role_row = connection.execute(
+                """
+                SELECT
+                    current_user AS current_user,
+                    to_regrole(?) IS NOT NULL AS bypass_role_exists,
+                    CASE
+                        WHEN to_regrole(?) IS NULL THEN false
+                        ELSE pg_has_role(current_user, to_regrole(?), 'member')
+                    END AS current_user_has_bypass_role
+                """,
+                (role, role, role),
+            ).fetchone()
+            status.update(row_to_dict(role_row) or {})
+        policy_row = connection.execute(
+            """
+            SELECT COUNT(*) AS tenant_policy_count
+            FROM pg_policies
+            WHERE schemaname = ? AND policyname = 'tenant_isolation'
+            """,
+            (connection.schema,),
+        ).fetchone()
+        function_row = connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = ? AND p.proname = 'agent_rls_has_bypass_role'
+            ) AS bypass_function_exists
+            """,
+            (connection.schema,),
+        ).fetchone()
+        status.update(row_to_dict(policy_row) or {})
+        status.update(row_to_dict(function_row) or {})
+    finally:
+        if owns_connection:
+            connection.close()
+    return status
+
+
+def _ensure_schema_migrations(conn: sqlite3.Connection | PostgresConnection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            id TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _record_schema_migration(
+    conn: sqlite3.Connection | PostgresConnection,
+    migration_id: str,
+    description: str,
+) -> None:
+    checksum = hashlib.sha256(f"{migration_id}:{description}".encode("utf-8")).hexdigest()
+    existing = conn.execute("SELECT id FROM schema_migrations WHERE id = ?", (migration_id,)).fetchone()
+    if existing:
+        return
+    conn.execute(
+        """
+        INSERT INTO schema_migrations (id, description, checksum, applied_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (migration_id, description, checksum, utc_now()),
+    )
+
+
+def _ensure_indexes(conn: sqlite3.Connection | PostgresConnection) -> None:
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_business_requests_status_created
+            ON business_requests(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_business_requests_tenant_created
+            ON business_requests(tenant_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_created
+            ON auth_sessions(user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires
+            ON auth_sessions(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_auth_login_attempts_user_created
+            ON auth_login_attempts(user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_auth_login_attempts_lockout
+            ON auth_login_attempts(user_id, lockout_until);
+        CREATE INDEX IF NOT EXISTS idx_workflow_runs_status_created
+            ON workflow_runs(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_workflow_runs_tenant_created
+            ON workflow_runs(tenant_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_workflow_runs_request_created
+            ON workflow_runs(request_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_workflow_jobs_status_created
+            ON workflow_jobs(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_workflow_jobs_tenant_created
+            ON workflow_jobs(tenant_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_workflow_steps_run_index
+            ON workflow_steps(run_id, step_index);
+        CREATE INDEX IF NOT EXISTS idx_multi_agent_runs_status_created
+            ON multi_agent_runs(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_multi_agent_runs_tenant_created
+            ON multi_agent_runs(tenant_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_multi_agent_messages_run_created
+            ON multi_agent_messages(run_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_agent_memory_tenant_created
+            ON agent_memory(tenant_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_agent_checkpoints_run_index
+            ON agent_checkpoints(run_id, checkpoint_index);
+        CREATE INDEX IF NOT EXISTS idx_golden_traces_tenant_created
+            ON golden_traces(tenant_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_trace_replays_tenant_created
+            ON trace_replays(tenant_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_approvals_status_created
+            ON approvals(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_approvals_tenant_status_created
+            ON approvals(tenant_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_tickets_status_updated
+            ON tickets(status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_tickets_tenant_status_updated
+            ON tickets(tenant_id, status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_tickets_external_id
+            ON tickets(external_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_idempotency_key
+            ON tickets(idempotency_key)
+            WHERE idempotency_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_emails_status_created
+            ON emails(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_emails_tenant_created
+            ON emails(tenant_id, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_emails_idempotency_key
+            ON emails(idempotency_key)
+            WHERE idempotency_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_external_outbox_status_created
+            ON external_outbox(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_external_outbox_tenant_status_created
+            ON external_outbox(tenant_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_external_outbox_target
+            ON external_outbox(target_type, target_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_external_outbox_idempotency_key
+            ON external_outbox(idempotency_key)
+            WHERE idempotency_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_knowledge_articles_category
+            ON knowledge_articles(category);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_created
+            ON audit_logs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_created
+            ON audit_logs(tenant_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_event_target
+            ON audit_logs(event_type, target_type, target_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_row_hash
+            ON audit_logs(row_hash);
+        """
+    )
+
+
+def _ensure_postgres_rls(conn: sqlite3.Connection | PostgresConnection) -> None:
+    if not is_postgres_connection(conn) or not settings.postgres_rls_enabled:
+        return
+    conn.execute(
+        """
+        CREATE OR REPLACE FUNCTION agent_rls_has_bypass_role()
+        RETURNS boolean
+        LANGUAGE plpgsql
+        STABLE
+        AS $$
+        DECLARE
+            configured_role text := NULLIF(current_setting('app.rls_bypass_role', true), '');
+            configured_role_oid oid;
+        BEGIN
+            IF configured_role IS NULL THEN
+                RETURN true;
+            END IF;
+            configured_role_oid := to_regrole(configured_role);
+            IF configured_role_oid IS NULL THEN
+                RETURN false;
+            END IF;
+            RETURN pg_has_role(current_user, configured_role_oid, 'member');
+        END;
+        $$;
+        """
+    )
+    tenant_expr = "COALESCE(NULLIF(current_setting('app.tenant_id', true), ''), 'default')"
+    bypass_expr = "(current_setting('app.rls_bypass', true) = 'on' AND agent_rls_has_bypass_role())"
+    for table in TENANT_RLS_TABLES:
+        quoted_table = quote_identifier(table)
+        predicate = f"({bypass_expr} OR tenant_id = {tenant_expr})"
+        conn.execute(f"ALTER TABLE {quoted_table} ENABLE ROW LEVEL SECURITY")
+        conn.execute(f"ALTER TABLE {quoted_table} FORCE ROW LEVEL SECURITY")
+        conn.execute(f"DROP POLICY IF EXISTS tenant_isolation ON {quoted_table}")
+        conn.execute(
+            f"""
+            CREATE POLICY tenant_isolation ON {quoted_table}
+            USING ({predicate})
+            WITH CHECK ({predicate})
+            """
+        )
+
+    for table, parent_table, foreign_key in RELATED_RLS_TABLES:
+        quoted_table = quote_identifier(table)
+        quoted_parent = quote_identifier(parent_table)
+        quoted_fk = quote_identifier(foreign_key)
+        predicate = (
+            f"{bypass_expr} OR EXISTS ("
+            f"SELECT 1 FROM {quoted_parent} parent "
+            f"WHERE parent.id = {quoted_table}.{quoted_fk} "
+            f"AND (parent.tenant_id = {tenant_expr} OR {bypass_expr})"
+            f")"
+        )
+        conn.execute(f"ALTER TABLE {quoted_table} ENABLE ROW LEVEL SECURITY")
+        conn.execute(f"ALTER TABLE {quoted_table} FORCE ROW LEVEL SECURITY")
+        conn.execute(f"DROP POLICY IF EXISTS tenant_isolation ON {quoted_table}")
+        conn.execute(
+            f"""
+            CREATE POLICY tenant_isolation ON {quoted_table}
+            USING ({predicate})
+            WITH CHECK ({predicate})
+            """
+        )
+
+
+def _ensure_column(conn: sqlite3.Connection | PostgresConnection, table: str, column: str, definition: str) -> None:
+    if is_postgres_connection(conn):
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = ? AND table_name = ? AND column_name = ?
+            LIMIT 1
+            """,
+            (conn.schema, table, column),
+        ).fetchone()
+        if not row:
+            conn.execute(f"ALTER TABLE {quote_identifier(table)} ADD COLUMN {quote_identifier(column)} {definition}")
+        return
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def reset_database(seed: bool = True) -> None:
+    if settings.db_backend == "postgres":
+        quoted_schema = quote_identifier(settings.postgres_schema)
+        with get_connection(purpose="migration") as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+            conn.execute(f"CREATE SCHEMA {quoted_schema}")
+            conn.execute(f"SET search_path TO {quoted_schema}")
+        init_db(seed=seed)
+        return
     if settings.db_path.exists():
         settings.db_path.unlink()
     init_db(seed=seed)
 
 
-def seed_demo_data() -> None:
+def clear_run_history() -> dict[str, int]:
+    tables = [
+        "trace_replays",
+        "golden_traces",
+        "agent_checkpoints",
+        "multi_agent_messages",
+        "multi_agent_runs",
+        "agent_memory",
+        "workflow_steps",
+        "approvals",
+        "emails",
+        "tickets",
+        "external_outbox",
+        "workflow_jobs",
+        "workflow_runs",
+        "business_requests",
+        "eval_reports",
+        "audit_logs",
+        "auth_login_attempts",
+    ]
+    deleted: dict[str, int] = {}
     with get_connection() as conn:
+        for table in tables:
+            cursor = conn.execute(f"DELETE FROM {table}")
+            deleted[table] = cursor.rowcount if cursor.rowcount != -1 else 0
+
+    checkpoint_path = settings.db_path.parent / "langgraph_checkpoints.sqlite3"
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        deleted["langgraph_checkpoints"] = 1
+    else:
+        deleted["langgraph_checkpoints"] = 0
+
+    return deleted
+
+
+def is_postgres_connection(conn: Any) -> bool:
+    return getattr(conn, "backend", "") == "postgres"
+
+
+def clean_identifier(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in value.strip())
+    if not cleaned:
+        raise ValueError("PostgreSQL schema/table identifier cannot be empty.")
+    if cleaned[0].isdigit():
+        cleaned = f"_{cleaned}"
+    return cleaned
+
+
+def quote_identifier(value: str) -> str:
+    return '"' + clean_identifier(value).replace('"', '""') + '"'
+
+
+def translate_sqlite_placeholders(sql: str) -> str:
+    return sql.replace("?", "%s")
+
+
+def split_sql_script(script: str) -> list[str]:
+    return [statement.strip() for statement in script.split(";") if statement.strip()]
+
+
+def seed_demo_data(purpose: str | None = None) -> None:
+    with get_connection(purpose=purpose) as conn:
         existing = conn.execute("SELECT COUNT(*) AS count FROM knowledge_articles").fetchone()["count"]
         if existing:
             return

@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.config import settings  # noqa: E402
-from app.db import init_db  # noqa: E402
+from app.db import set_connection_purpose, init_db  # noqa: E402
+from app.services.observability import configure_observability  # noqa: E402
 from app.services.jobs import run_worker_loop  # noqa: E402
 
 
@@ -21,9 +22,12 @@ def main() -> None:
     parser.add_argument("--stop-after-idle", type=int, default=None)
     args = parser.parse_args()
 
-    init_db(seed=settings.auto_seed)
+    set_connection_purpose("worker")
+    configure_observability()
+    if settings.auto_migrate:
+        init_db(seed=settings.auto_seed)
     print(
-        f"Worker {args.worker_id} started. db={settings.db_path} poll_interval={args.poll_interval}",
+        f"Worker {args.worker_id} started. backend={settings.db_backend} poll_interval={args.poll_interval}",
         flush=True,
     )
     run_worker_loop(
