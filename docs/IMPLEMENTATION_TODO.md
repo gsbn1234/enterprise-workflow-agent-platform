@@ -17,8 +17,8 @@
 - [x] `workflow_steps`：每个节点/tool call 的 trace
 - [x] `workflow_jobs`：异步任务队列
 - [x] `approvals`：人工审批
-- [x] `customers`：演示 CRM
-- [x] `tickets`：演示工单系统
+- [x] `customers` / `customer_interactions`：多租户 CRM 档案、健康度和互动时间线
+- [x] `tickets` / `ticket_events`：带状态机、SLA 和操作时间线的工单系统
 - [x] `emails`：演示邮件记录
 - [x] `knowledge_articles`：本地政策知识库
 - [x] `audit_logs`：审计日志
@@ -29,7 +29,8 @@
 - [x] `agent_checkpoints`：业务可读的 LangGraph checkpoint 镜像
 - [x] `golden_traces`：可复用的黄金轨迹
 - [x] `trace_replays`：历史 run 重放和 diff 报告
-- [ ] PostgreSQL + Alembic 迁移
+- [x] PostgreSQL 生产后端与可重复 schema migration
+- [ ] 引入 Alembic 管理版本化迁移
 - [x] tenant_id / workspace_id 多租户字段
 
 ## Phase 2：单 Agent Workflow
@@ -50,8 +51,9 @@
 
 - [x] `query_enterprise_rag`：企业 RAG 工具
 - [x] `search_knowledge`：本地政策库检索
-- [x] `lookup_customer`：CRM 查询
-- [x] `create_ticket` / `update_ticket`：工单工具
+- [x] `lookup_customer`：tenant-scoped CRM 查询
+- [x] CRM CRUD、筛选、互动记录、部门 RBAC 与审计
+- [x] `create_ticket` / `update_ticket`：状态机、SLA、时间线和 Outbox 更新重试
 - [x] `draft_email` / `send_email`：邮件工具
 - [x] `request_approval`：审批工具
 - [x] 工具注册表：JSON Schema、输出形态、副作用、审批要求、角色要求
@@ -59,8 +61,10 @@
 - [x] MCP stdio JSON-RPC：tools/list、tools/call、resources/read、prompts/get
 - [x] MCP 工具调用写入 audit
 - [ ] 替换为官方 MCP SDK
-- [ ] 工具权限矩阵：role / department / tenant / data scope
-- [ ] 真实系统适配：Jira/Linear、Salesforce/HubSpot、Gmail/Outlook、Slack/Teams
+- [x] 核心工具权限：role / department / tenant / ticket data scope
+- [ ] 把权限矩阵扩展到每个外部连接器与细粒度 action scope
+- [x] Jira、通用 HTTP 工单和 SMTP 邮件适配
+- [ ] Linear、Salesforce/HubSpot、Gmail/Outlook、Slack/Teams 适配
 
 ## Phase 4：多智能体平台
 
@@ -73,15 +77,15 @@
 - [x] 多智能体 API：run/list/detail/memory
 - [x] 多智能体 UI：展示子 Agent 轨迹、critic 分数、workflow 关联
 - [x] 子 Agent 失败时把 multi-agent run 标记为 failed
-- [x] Supervisor 路由结果影响是否调用 Risk Agent
+- [x] Supervisor 动态跳过现有工单命令不需要的 Research；所有执行路径强制经过双 Risk Agent
 - [x] LangGraph `StateGraph` 编排多智能体节点
 - [x] `thread_id` + SQLite checkpointer 保存 durable 状态
-- [x] Critic-driven self-correction：critic 失败后自动生成修复要求并重新执行一次
+- [x] Critic-driven self-correction：仅在没有成功副作用时自动修复重试，已有副作用则转人工复核
 - [x] Trace replay：基于历史 objective 和 requester 重新运行
 - [x] Golden trace diff：比较 Agent 序列、tool 序列、checkpoint 序列和 workflow 状态
-- [ ] 多 Agent 并行执行
-- [ ] Multi-agent debate / vote：高风险场景多策略投票
-- [ ] Memory-augmented planning：相似案例真正影响下一次计划
+- [x] 多 Agent 并行执行：双 Research、双 Risk fan-out/fan-in
+- [x] Multi-agent debate / vote：合规与业务风险独立投票，保守共识聚合
+- [x] Memory-augmented planning：相似失败模式会升级风险投票与审批决策
 
 ## Phase 5：Human-in-the-loop
 
@@ -92,7 +96,8 @@
 - [x] 审批行为写入审计
 - [ ] 多级审批链
 - [ ] 审批超时升级
-- [ ] 审批人部门/金额权限
+- [x] 审批人角色、部门与租户范围
+- [ ] 审批金额授权额度
 
 ## Phase 6：可观测性、审计与指标
 
@@ -104,7 +109,8 @@
 - [x] durable agent checkpoint trace
 - [x] trace replay / golden diff 报告
 - [x] eval reports
-- [ ] OpenTelemetry trace/span
+- [x] OpenTelemetry HTTP、workflow、job 与 tool step trace/span
+- [ ] Agent message、外部 HTTP 和数据库查询的更细粒度 span
 - [ ] Langfuse/LangSmith trace adapter
 - [x] trace replay CLI
 - [x] golden trace diff CLI/API
@@ -120,9 +126,11 @@
 - [x] 评测结果写入 JSON/JSONL 与 `eval_reports`
 - [x] smoke tests 覆盖 workflow、async job、auth、RAG、MCP、retry、multi-agent
 - [ ] LLM-as-judge adapter
-- [ ] adversarial prompt injection 评测集
+- [x] 基础 adversarial smoke：审批绕过、prompt injection、账号锁定和越权调用
+- [ ] 扩展 adversarial 数据集与持续红队评测
 - [ ] 成本/延迟回归阈值
-- [ ] CI 自动跑 smoke + harness
+- [x] GitHub Actions 自动运行核心 smoke、权限、安全、多 Agent 与前端构建
+- [ ] 将完整 harness 增加成本/延迟回归阈值后设为阻断门禁
 
 ## Phase 8：管理台
 
@@ -149,9 +157,9 @@
 - [x] 文档化本地与 Docker 启动
 - [ ] pytest 单元测试拆分
 - [ ] ruff / mypy
-- [ ] GitHub Actions
-- [ ] PostgreSQL 生产配置
-- [ ] Redis/Celery 或 RQ
+- [x] GitHub Actions
+- [x] PostgreSQL 生产配置
+- [x] Redis Queue + 独立 Worker
 - [ ] secret management
 
 ## Phase 10：求职包装

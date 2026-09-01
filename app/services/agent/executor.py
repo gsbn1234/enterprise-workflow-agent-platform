@@ -10,6 +10,7 @@ from app.services.agent.retry import RetryPolicy, classify_error, default_retry_
 from app.services.agent.state import WorkflowContext
 from app.services.agent.ticket_commands import execute_ticket_query, execute_ticket_update, parse_ticket_command
 from app.services.audit import record_audit
+from app.services.llm import polish_agent_answer
 from app.services.observability import start_span
 from app.services.requests import get_business_request, update_business_request_status
 from app.services.tenancy import effective_tenant_id
@@ -33,6 +34,9 @@ def run_workflow(
     requester_department: str | None = None,
     requester_role: str | None = None,
     tenant_id: str | None = None,
+    plan_override: dict | None = None,
+    knowledge_override: dict | None = None,
+    risk_override: dict | None = None,
 ) -> dict:
     started = time.perf_counter()
     run_id = new_id("run")
@@ -87,8 +91,36 @@ def run_workflow(
         )
         return get_run_detail(run_id)
 
+    coordinated_plan = _coordinated_plan(plan_override, risk_override)
+    coordination = {
+        "supervisor_plan_consumed": bool(plan_override),
+        "shared_evidence_consumed": bool(knowledge_override),
+        "synthesized_evidence_consumed": isinstance(knowledge_override, dict) and "evidence" in knowledge_override,
+        "risk_consensus_consumed": bool(risk_override),
+    }
     ticket_command = parse_ticket_command(objective)
     if ticket_command:
+        ticket_coordination = {
+            **coordination,
+            "shared_evidence_consumed": False,
+            "synthesized_evidence_consumed": False,
+            "evidence_not_required": "scoped_existing_ticket_command",
+        }
+        plan = _run_step(
+            context,
+            "plan",
+            "planner",
+            None,
+            {
+                "objective": objective,
+                "source": "supervisor_handoff" if coordinated_plan else "workflow_planner",
+                "coordination": ticket_coordination,
+            },
+            lambda: coordinated_plan or plan_workflow(objective).__dict__,
+            "Consume the supervisor plan before executing a scoped existing-ticket command.",
+        )
+        context.artifacts["plan"] = plan
+        _update_run_plan(run_id, plan)
         command_payload = _run_step(
             context,
             "interpret_ticket_command",
@@ -99,7 +131,6 @@ def run_workflow(
             "Recognize natural-language ticket query or update intent before creating any new work item.",
         )
         category = "ticket_update" if ticket_command.intent == "update" else "ticket_query"
-        _set_run_classification(run_id, category, "medium" if ticket_command.intent == "update" else "low", False)
         if request_id:
             update_business_request_status(request_id, "running", category)
 
@@ -166,15 +197,20 @@ def run_workflow(
         "plan",
         "planner",
         None,
-        {"objective": objective},
-        lambda: plan_workflow(objective).__dict__,
-        "Classify the request, estimate risk, and choose the tool path.",
+        {
+            "objective": objective,
+            "source": "supervisor_handoff" if coordinated_plan else "workflow_planner",
+            "coordination": coordination,
+        },
+        lambda: coordinated_plan or plan_workflow(objective).__dict__,
+        "Consume the supervisor plan when present; otherwise classify the request, estimate risk, and choose the tool path.",
     )
     context.artifacts["plan"] = plan
     _update_run_plan(run_id, plan)
     if request_id:
         update_business_request_status(request_id, "running", plan["category"])
 
+    shared_rag = (knowledge_override or {}).get("enterprise_rag") if knowledge_override else None
     rag_knowledge = _run_step(
         context,
         "retrieve_enterprise_rag",
@@ -186,28 +222,38 @@ def run_workflow(
             "user_context": {
                 "user_id": requester_user_id,
                 "user_department": requester_department,
+                "user_role": requester_role,
             },
+            "source": "research_agent_handoff" if shared_rag is not None else "direct_tool_call",
         },
-        lambda: query_enterprise_rag(
+        lambda: shared_rag
+        if shared_rag is not None
+        else query_enterprise_rag(
             objective,
             top_k=3,
             user_id=requester_user_id,
             user_department=requester_department,
+            user_role=requester_role,
         ),
-        "Query the enterprise RAG system as a first-class knowledge tool with user context.",
+        "Consume ACL-filtered evidence from the research agent, or query enterprise RAG directly when no handoff exists.",
     )
     context.artifacts["rag_knowledge"] = rag_knowledge
 
+    shared_local = (knowledge_override or {}).get("local_policy") if knowledge_override else None
     local_knowledge = _run_step(
         context,
         "retrieve_policy",
         "tool_call",
         "search_knowledge",
-        {"query": objective, "limit": 3},
-        lambda: search_knowledge(objective, limit=3),
-        "Retrieve local policy evidence as fallback and comparison context for the workflow.",
+        {
+            "query": objective,
+            "limit": 3,
+            "source": "research_agent_handoff" if shared_local is not None else "direct_tool_call",
+        },
+        lambda: shared_local if shared_local is not None else search_knowledge(objective, limit=3),
+        "Consume the local-policy research handoff, or retrieve fallback evidence directly when no handoff exists.",
     )
-    knowledge = _effective_knowledge(rag_knowledge, local_knowledge)
+    knowledge = _coordinated_knowledge(knowledge_override, rag_knowledge, local_knowledge)
     context.artifacts["knowledge"] = knowledge
 
     customer = {"customer": None, "matched_by": None}
@@ -217,8 +263,8 @@ def run_workflow(
             "collect_customer_context",
             "tool_call",
             "lookup_customer",
-            {"query": objective},
-            lambda: lookup_customer(objective),
+            {"query": objective, "tenant_id": tenant},
+            lambda: lookup_customer(objective, tenant_id=tenant),
             "Look up customer context only for customer-facing workflows such as refunds and complaints.",
         )
     context.artifacts["customer"] = customer.get("customer")
@@ -234,6 +280,7 @@ def run_workflow(
             "rag_citations": rag_knowledge.get("citations", []),
             "requester_user_id": requester_user_id,
             "requester_department": requester_department,
+            "multi_agent_coordination": coordination,
         }
         approval = _run_step(
             context,
@@ -340,6 +387,7 @@ def run_workflow(
                 ticket["id"],
                 comment=f"Internal notification sent to {plan['recommended_owner']}.",
                 agent_run_id=run_id,
+                tenant_id=tenant,
             )
             or {"error": f"Ticket {ticket['id']} was not found."},
             "Append the internal notification outcome to the external ticket timeline.",
@@ -357,68 +405,6 @@ def run_workflow(
             "Prepare a customer-safe message but do not send high-risk content without approval.",
         )
         context.artifacts["draft_email"] = draft
-
-    if plan["needs_approval"]:
-        approval_payload = {
-            "ticket_id": ticket["id"],
-            "plan": plan,
-            "email": context.artifacts.get("draft_email"),
-            "notification": context.artifacts.get("notification"),
-            "knowledge": knowledge.get("results", []),
-            "rag_citations": rag_knowledge.get("citations", []),
-            "requester_user_id": requester_user_id,
-            "requester_department": requester_department,
-        }
-        approval = _run_step(
-            context,
-            "request_approval",
-            "approval",
-            "request_approval",
-            approval_payload,
-            lambda: create_approval(
-                run_id,
-                plan.get("approval_action") or "business_action",
-                "send_email" if context.artifacts.get("draft_email") else "update_ticket",
-                approval_payload,
-                requested_by="agent",
-                tenant_id=tenant,
-            ),
-            "Pause before risky execution and ask a human to approve the proposed action.",
-        )
-        approval_sync = _run_step(
-            context,
-            "sync_ticket_waiting_approval",
-            "state_update",
-            "update_ticket",
-            {
-                "ticket_id": ticket["id"],
-                "status": "waiting_approval",
-                "approval_id": approval.get("id"),
-                "agent_run_id": run_id,
-            },
-            lambda: update_ticket(
-                ticket["id"],
-                status="waiting_approval",
-                approval_id=approval.get("id"),
-                agent_run_id=run_id,
-                comment=f"Waiting for approval: {' -> '.join(plan.get('approval_chain') or []) or 'human reviewer'}.",
-            )
-            or {"error": f"Ticket {ticket['id']} was not found."},
-            "Mirror the approval pause to the external ticket system.",
-        )
-        if _has_step_error(approval_sync):
-            return _fail_workflow_from_tool_error(run_id, started, request_id, plan, "update_ticket", approval_sync)
-        final_answer = _pending_answer(plan, ticket, approval)
-        _complete_run(
-            run_id,
-            status="waiting_approval",
-            final_answer=final_answer,
-            started=started,
-            needs_approval=True,
-        )
-        if request_id:
-            update_business_request_status(request_id, "waiting_approval", plan["category"])
-        return get_run_detail(run_id)
 
     sent_email = None
     if context.artifacts.get("draft_email"):
@@ -446,6 +432,7 @@ def run_workflow(
             status=_final_ticket_status(plan, sent_email),
             comment=f"Workflow completed with final status {_final_ticket_status(plan, sent_email)}.",
             agent_run_id=run_id,
+            tenant_id=tenant,
         )
         or {"error": f"Ticket {ticket['id']} was not found."},
         "Move the ticket to the correct operational state after agent execution.",
@@ -470,6 +457,9 @@ def decide_approval_and_resume(approval_id: str, approved: bool, decided_by: str
     run = _get_run_row(run_id)
     if not run:
         return None
+    requested_status = "approved" if approved else "denied"
+    if approval.get("status") != requested_status or not approval.get("decision_applied"):
+        return get_run_detail(run_id)
     tenant = effective_tenant_id(run.get("tenant_id"))
     context = WorkflowContext(run_id=run_id, objective=run["objective"])
     payload = approval["payload"] or {}
@@ -502,6 +492,7 @@ def decide_approval_and_resume(approval_id: str, approved: bool, decided_by: str
                     actor=decided_by,
                     approval_id=approval_id,
                     agent_run_id=run_id,
+                    tenant_id=tenant,
                 )
                 or {"error": f"Ticket {denied_ticket_id} was not found."},
                 "Mark the operational ticket as rejected when the human reviewer denies the action.",
@@ -589,6 +580,7 @@ def decide_approval_and_resume(approval_id: str, approved: bool, decided_by: str
                     approval_id=approval_id,
                     agent_run_id=run_id,
                     evidence=[notification] if isinstance(notification, dict) else None,
+                    tenant_id=tenant,
                 )
                 or {"error": f"Ticket {ticket['id']} was not found."},
                 "Append the internal notification outcome to the ticket timeline.",
@@ -652,6 +644,7 @@ def decide_approval_and_resume(approval_id: str, approved: bool, decided_by: str
                 actor=decided_by,
                 approval_id=approval_id,
                 agent_run_id=run_id,
+                tenant_id=tenant,
             )
             or {"error": f"Ticket {ticket['id']} was not found."},
             "Finalize the newly created ticket after approved execution.",
@@ -717,6 +710,7 @@ def decide_approval_and_resume(approval_id: str, approved: bool, decided_by: str
                 actor=decided_by,
                 approval_id=approval_id,
                 agent_run_id=run_id,
+                tenant_id=tenant,
             )
             or {"error": f"Ticket {ticket_id} was not found."},
             "Update the operational ticket after approval execution.",
@@ -927,6 +921,42 @@ def _next_step_index(run_id: str) -> int:
     return int(row["next_index"])
 
 
+def _coordinated_plan(plan_override: dict | None, risk_override: dict | None) -> dict | None:
+    if not isinstance(plan_override, dict):
+        return None
+    required_fields = {
+        "category",
+        "priority",
+        "risk_level",
+        "needs_approval",
+        "recommended_owner",
+        "proposed_tools",
+    }
+    if not required_fields.issubset(plan_override):
+        return None
+
+    plan = dict(plan_override)
+    if not isinstance(risk_override, dict):
+        return plan
+
+    risk_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+    plan_risk = str(plan.get("risk_level") or "low")
+    consensus_risk = str(risk_override.get("risk_level") or plan_risk)
+    if risk_order.get(consensus_risk, 0) > risk_order.get(plan_risk, 0):
+        plan["risk_level"] = consensus_risk
+    if risk_override.get("needs_approval"):
+        plan["needs_approval"] = True
+        if "request_approval" not in plan["proposed_tools"]:
+            plan["proposed_tools"] = [*plan["proposed_tools"], "request_approval"]
+    plan["risk_consensus"] = {
+        "decision": risk_override.get("decision"),
+        "warnings": list(risk_override.get("warnings") or []),
+        "consensus_rule": risk_override.get("consensus_rule"),
+        "votes": list(risk_override.get("votes") or []),
+    }
+    return plan
+
+
 def _update_run_plan(run_id: str, plan: dict) -> None:
     _set_run_classification(run_id, plan["category"], plan["risk_level"], bool(plan["needs_approval"]))
 
@@ -960,6 +990,15 @@ def _complete_run(
     needs_approval: bool | None = None,
 ) -> None:
     latency_ms = int((time.perf_counter() - started) * 1000) if started is not None else 0
+    run_before = _get_run_row(run_id) or {}
+    polished_answer = polish_agent_answer(
+        final_answer,
+        status=status,
+        category=run_before.get("category"),
+        risk_level=run_before.get("risk_level"),
+    )
+    if polished_answer:
+        final_answer = polished_answer
     cost = estimate_token_cost(final_answer)
     completed_at = None if status == "waiting_approval" else utc_now()
     with get_connection() as conn:
@@ -987,7 +1026,7 @@ def _complete_run(
                 run_id,
             ),
         )
-    run = _get_run_row(run_id)
+    run = _get_run_row(run_id) or run_before
     logger.info(
         "workflow.run_completed",
         extra={
@@ -1093,6 +1132,42 @@ def _effective_knowledge(rag_knowledge: dict, local_knowledge: dict) -> dict:
     }
 
 
+def _coordinated_knowledge(
+    knowledge_override: dict | None,
+    rag_knowledge: dict,
+    local_knowledge: dict,
+) -> dict:
+    synthesized = list((knowledge_override or {}).get("evidence") or [])
+    if not synthesized:
+        return _effective_knowledge(rag_knowledge, local_knowledge)
+    normalized = []
+    for item in synthesized[:10]:
+        if not isinstance(item, dict):
+            continue
+        normalized.append(
+            {
+                **item,
+                "title": str(item.get("title") or "Policy evidence"),
+                "snippet": str(item.get("snippet") or item.get("content") or "")[:320],
+                "source": str(item.get("source") or "research_agent"),
+            }
+        )
+    effective = _effective_knowledge(rag_knowledge, local_knowledge)
+    effective.update(
+        {
+            "source": str((knowledge_override or {}).get("selected_source") or effective["source"]),
+            "results": normalized,
+            "synthesis": {
+                "reasoning_mode": (knowledge_override or {}).get("reasoning_mode"),
+                "summary": (knowledge_override or {}).get("synthesis_summary"),
+                "conflicts": list((knowledge_override or {}).get("conflicts") or []),
+                "warnings": list((knowledge_override or {}).get("warnings") or []),
+            },
+        }
+    )
+    return effective
+
+
 def _ticket_description(objective: str, plan: dict, knowledge: dict) -> str:
     evidence = "\n".join(f"- {item['title']}: {item['snippet']}" for item in knowledge.get("results", [])[:3])
     approval_chain = " -> ".join(plan.get("approval_chain") or []) or "无需人工审批"
@@ -1164,15 +1239,6 @@ def _approval_legacy_completed_answer(sent_email: dict | None) -> str:
     if sent_email:
         answer += f" 已发送邮件 {sent_email['id']}。"
     return answer
-
-
-def _pending_answer(plan: dict, ticket: dict, approval: dict) -> str:
-    chain = " -> ".join(plan.get("approval_chain") or []) or "负责人"
-    return (
-        f"已创建工单 {ticket['id']}，流程 {plan.get('workflow_type')}，分类 {plan['category']}，风险等级 {plan['risk_level']}。"
-        f"由于该动作需要 {chain} 审批，已创建审批单 {approval['id']}，当前等待确认。"
-        f"Agent 不会直接执行：{', '.join(plan.get('blocked_actions') or []) or '无'}。"
-    )
 
 
 def _completed_answer(plan: dict, ticket: dict, sent_email: dict | None) -> str:

@@ -320,6 +320,10 @@ def _dispatch_outbox_event(event: dict) -> dict:
             approval_id=payload.get("approval_id"),
             tenant_id=payload.get("tenant_id") or event.get("tenant_id"),
         )
+    if action_type == "ticket.update":
+        from app.services.tools.ticketing import replay_ticket_update
+
+        return replay_ticket_update(event["id"], payload)
     if action_type == "email.send":
         from app.services.tools.email import send_email
 

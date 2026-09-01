@@ -8,55 +8,76 @@ from app.services.queue import queue_status
 from app.utils import utc_now
 
 
-def metrics_summary() -> dict:
+def metrics_summary(tenant_id: str | None = None) -> dict:
+    tenant_params = (tenant_id, tenant_id)
     with get_connection() as conn:
         run_counts = rows_to_dicts(
             conn.execute(
                 """
                 SELECT status, COUNT(*) AS count
                 FROM workflow_runs
+                WHERE (? IS NULL OR tenant_id = ?)
                 GROUP BY status
-                """
+                """,
+                tenant_params,
             ).fetchall()
         )
         tool_counts = rows_to_dicts(
             conn.execute(
                 """
-                SELECT tool_name, COUNT(*) AS count, AVG(latency_ms) AS avg_latency_ms
-                FROM workflow_steps
-                WHERE tool_name IS NOT NULL
-                GROUP BY tool_name
+                SELECT steps.tool_name, COUNT(*) AS count, AVG(steps.latency_ms) AS avg_latency_ms
+                FROM workflow_steps steps
+                JOIN workflow_runs runs ON runs.id = steps.run_id
+                WHERE steps.tool_name IS NOT NULL
+                  AND (? IS NULL OR runs.tenant_id = ?)
+                GROUP BY steps.tool_name
                 ORDER BY count DESC
-                """
+                """,
+                tenant_params,
             ).fetchall()
         )
         totals = conn.execute(
             """
+            WITH
+              scoped_runs AS (SELECT * FROM workflow_runs WHERE (? IS NULL OR tenant_id = ?)),
+              scoped_approvals AS (SELECT * FROM approvals WHERE (? IS NULL OR tenant_id = ?)),
+              scoped_tickets AS (SELECT * FROM tickets WHERE (? IS NULL OR tenant_id = ?)),
+              scoped_emails AS (SELECT * FROM emails WHERE (? IS NULL OR tenant_id = ?)),
+              scoped_jobs AS (SELECT * FROM workflow_jobs WHERE (? IS NULL OR tenant_id = ?)),
+              scoped_multi_runs AS (SELECT * FROM multi_agent_runs WHERE (? IS NULL OR tenant_id = ?)),
+              scoped_customers AS (SELECT * FROM customers WHERE (? IS NULL OR tenant_id = ?)),
+              scoped_interactions AS (SELECT * FROM customer_interactions WHERE (? IS NULL OR tenant_id = ?))
             SELECT
-                (SELECT COUNT(*) FROM workflow_runs) AS runs,
-                (SELECT COUNT(*) FROM workflow_runs WHERE status = 'completed') AS completed_runs,
-                (SELECT COUNT(*) FROM workflow_runs WHERE status = 'failed') AS failed_runs,
-                (SELECT COUNT(*) FROM workflow_runs WHERE status = 'waiting_approval') AS waiting_runs,
-                (SELECT COUNT(*) FROM approvals WHERE status = 'pending') AS pending_approvals,
-                (SELECT COUNT(*) FROM approvals WHERE status IN ('approved', 'denied')) AS decided_approvals,
-                (SELECT COUNT(*) FROM tickets) AS tickets,
-                (SELECT COUNT(*) FROM tickets WHERE provider != 'mock' OR external_id IS NOT NULL) AS external_tickets,
-                (SELECT COUNT(*) FROM emails) AS emails,
-                (SELECT COUNT(*) FROM emails WHERE status = 'sent') AS sent_emails,
-                (SELECT COUNT(*) FROM emails WHERE status = 'failed') AS failed_emails,
-                (SELECT COUNT(*) FROM workflow_jobs) AS jobs,
-                (SELECT COALESCE(AVG(latency_ms), 0) FROM workflow_runs) AS avg_latency_ms,
-                (SELECT COALESCE(AVG(critic_score), 0) FROM multi_agent_runs) AS avg_critic_score,
-                (SELECT COALESCE(SUM(cost_estimate), 0) FROM workflow_runs) AS estimated_cost
-            """
+                (SELECT COUNT(*) FROM scoped_runs) AS runs,
+                (SELECT COUNT(*) FROM scoped_runs WHERE status = 'completed') AS completed_runs,
+                (SELECT COUNT(*) FROM scoped_runs WHERE status = 'failed') AS failed_runs,
+                (SELECT COUNT(*) FROM scoped_runs WHERE status = 'waiting_approval') AS waiting_runs,
+                (SELECT COUNT(*) FROM scoped_approvals WHERE status = 'pending') AS pending_approvals,
+                (SELECT COUNT(*) FROM scoped_approvals WHERE status IN ('approved', 'denied')) AS decided_approvals,
+                (SELECT COUNT(*) FROM scoped_tickets) AS tickets,
+                (SELECT COUNT(*) FROM scoped_tickets WHERE provider != 'mock' OR external_id IS NOT NULL) AS external_tickets,
+                (SELECT COUNT(*) FROM scoped_emails) AS emails,
+                (SELECT COUNT(*) FROM scoped_emails WHERE status = 'sent') AS sent_emails,
+                (SELECT COUNT(*) FROM scoped_emails WHERE status = 'failed') AS failed_emails,
+                (SELECT COUNT(*) FROM scoped_jobs) AS jobs,
+                (SELECT COUNT(*) FROM scoped_customers) AS customers,
+                (SELECT COUNT(*) FROM scoped_customers WHERE status = 'at_risk') AS at_risk_customers,
+                (SELECT COUNT(*) FROM scoped_interactions) AS customer_interactions,
+                (SELECT COALESCE(AVG(latency_ms), 0) FROM scoped_runs) AS avg_latency_ms,
+                (SELECT COALESCE(AVG(critic_score), 0) FROM scoped_multi_runs) AS avg_critic_score,
+                (SELECT COALESCE(SUM(cost_estimate), 0) FROM scoped_runs) AS estimated_cost
+            """,
+            tenant_params * 8,
         ).fetchone()
         job_counts = rows_to_dicts(
             conn.execute(
                 """
                 SELECT status, COUNT(*) AS count
                 FROM workflow_jobs
+                WHERE (? IS NULL OR tenant_id = ?)
                 GROUP BY status
-                """
+                """,
+                tenant_params,
             ).fetchall()
         )
     return {
@@ -107,6 +128,9 @@ def prometheus_metrics() -> str:
         "agent_decided_approvals_total": totals.get("decided_approvals", 0),
         "agent_tickets_total": totals.get("tickets", 0),
         "agent_external_tickets_total": totals.get("external_tickets", 0),
+        "agent_customers_total": totals.get("customers", 0),
+        "agent_customers_at_risk_total": totals.get("at_risk_customers", 0),
+        "agent_customer_interactions_total": totals.get("customer_interactions", 0),
         "agent_emails_total": totals.get("emails", 0),
         "agent_emails_sent_total": totals.get("sent_emails", 0),
         "agent_emails_failed_total": totals.get("failed_emails", 0),

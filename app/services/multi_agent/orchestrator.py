@@ -6,6 +6,7 @@ from typing import Any
 
 from app.db import get_connection, row_to_dict, rows_to_dicts
 from app.services.audit import record_audit
+from app.services.multi_agent.coordination import list_handoffs, list_tasks
 from app.services.multi_agent.agents import (
     CriticAgent,
     MemoryAgent,
@@ -60,10 +61,10 @@ def run_multi_agent_legacy(
         conn.execute(
             """
             INSERT INTO multi_agent_runs
-            (id, objective, requester_user_id, requester_department, tenant_id, status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'running', ?)
+            (id, objective, requester_user_id, requester_department, requester_role, tenant_id, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
             """,
-            (run_id, objective, requester_user_id, requester_department, tenant, utc_now()),
+            (run_id, objective, requester_user_id, requester_department, requester_role, tenant, utc_now()),
         )
     record_audit(
         "multi_agent.start",
@@ -240,6 +241,8 @@ def get_multi_agent_run(run_id: str) -> dict | None:
     for message in messages:
         message["content"] = json_loads(message.pop("content_json"), {})
     run["messages"] = messages
+    run["tasks"] = list_tasks(run_id)
+    run["handoffs"] = list_handoffs(run_id)
     return run
 
 

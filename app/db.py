@@ -39,6 +39,12 @@ POSTGRES_RLS_BYPASS_ROLE_MIGRATION_ID = "0009_postgres_rls_bypass_role_gate"
 POSTGRES_RLS_BYPASS_ROLE_MIGRATION_DESCRIPTION = "Gate PostgreSQL RLS bypass on an optional database role"
 WORKFLOW_RUN_TICKET_LINK_MIGRATION_ID = "0010_workflow_run_ticket_link"
 WORKFLOW_RUN_TICKET_LINK_MIGRATION_DESCRIPTION = "Store the primary ticket created by each workflow run"
+CRM_FOUNDATION_MIGRATION_ID = "0011_tenant_crm_foundation"
+CRM_FOUNDATION_MIGRATION_DESCRIPTION = "Add tenant-scoped CRM profiles and customer interaction history"
+TICKET_TIMELINE_MIGRATION_ID = "0012_ticket_timeline"
+TICKET_TIMELINE_MIGRATION_DESCRIPTION = "Add tenant-scoped operational ticket history"
+TICKET_SLA_MIGRATION_ID = "0013_ticket_sla"
+TICKET_SLA_MIGRATION_DESCRIPTION = "Add ticket due dates and terminal lifecycle timestamps"
 
 
 TENANT_RLS_TABLES = (
@@ -50,6 +56,7 @@ TENANT_RLS_TABLES = (
     "golden_traces",
     "trace_replays",
     "approvals",
+    "customers",
     "tickets",
     "emails",
     "external_outbox",
@@ -59,7 +66,11 @@ TENANT_RLS_TABLES = (
 RELATED_RLS_TABLES = (
     ("workflow_steps", "workflow_runs", "run_id"),
     ("multi_agent_messages", "multi_agent_runs", "run_id"),
+    ("multi_agent_tasks", "multi_agent_runs", "run_id"),
+    ("multi_agent_handoffs", "multi_agent_runs", "run_id"),
     ("agent_checkpoints", "multi_agent_runs", "run_id"),
+    ("customer_interactions", "customers", "customer_id"),
+    ("ticket_events", "tickets", "ticket_id"),
 )
 
 
@@ -307,6 +318,7 @@ def init_db(seed: bool | None = None) -> None:
                 objective TEXT NOT NULL,
                 requester_user_id TEXT,
                 requester_department TEXT,
+                requester_role TEXT,
                 tenant_id TEXT NOT NULL DEFAULT 'default',
                 status TEXT NOT NULL,
                 workflow_run_id TEXT,
@@ -332,6 +344,36 @@ def init_db(seed: bool | None = None) -> None:
                 content_json TEXT NOT NULL,
                 status TEXT NOT NULL,
                 latency_ms INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES multi_agent_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS multi_agent_tasks (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                task_key TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                assigned_agent TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                dependencies_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL,
+                input_json TEXT NOT NULL DEFAULT '{}',
+                output_json TEXT NOT NULL DEFAULT '{}',
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE (run_id, task_key, attempt),
+                FOREIGN KEY (run_id) REFERENCES multi_agent_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS multi_agent_handoffs (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                from_agent TEXT NOT NULL,
+                to_agent TEXT NOT NULL,
+                task_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (run_id) REFERENCES multi_agent_runs(id) ON DELETE CASCADE
             );
@@ -403,12 +445,32 @@ def init_db(seed: bool | None = None) -> None:
             CREATE TABLE IF NOT EXISTS customers (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                tier TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                health_score INTEGER NOT NULL,
-                notes TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                tier TEXT NOT NULL DEFAULT 'starter',
+                status TEXT NOT NULL DEFAULT 'active',
+                email TEXT NOT NULL,
+                phone TEXT,
+                health_score INTEGER NOT NULL DEFAULT 100,
+                owner_department TEXT NOT NULL DEFAULT 'Customer Success',
+                owner_user_id TEXT,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                notes TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS customer_interactions (
+                id TEXT PRIMARY KEY,
+                customer_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                interaction_type TEXT NOT NULL,
+                channel TEXT NOT NULL DEFAULT 'internal',
+                summary TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}',
+                actor TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS tickets (
@@ -425,9 +487,26 @@ def init_db(seed: bool | None = None) -> None:
                 external_url TEXT,
                 idempotency_key TEXT,
                 external_payload_json TEXT NOT NULL DEFAULT '{}',
+                due_at TEXT,
+                resolved_at TEXT,
+                closed_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (customer_id) REFERENCES customers(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS ticket_events (
+                id TEXT PRIMARY KEY,
+                ticket_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                event_type TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                body TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS emails (
@@ -509,6 +588,13 @@ def init_db(seed: bool | None = None) -> None:
         _ensure_column(conn, "workflow_runs", "ticket_id", "TEXT")
         _ensure_column(conn, "workflow_jobs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
         _ensure_column(conn, "approvals", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "customers", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "customers", "status", "TEXT NOT NULL DEFAULT 'active'")
+        _ensure_column(conn, "customers", "phone", "TEXT")
+        _ensure_column(conn, "customers", "owner_department", "TEXT NOT NULL DEFAULT 'Customer Success'")
+        _ensure_column(conn, "customers", "owner_user_id", "TEXT")
+        _ensure_column(conn, "customers", "tags_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "customers", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "tickets", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
         _ensure_column(conn, "emails", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
         _ensure_column(conn, "audit_logs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
@@ -521,6 +607,8 @@ def init_db(seed: bool | None = None) -> None:
         _ensure_column(conn, "multi_agent_runs", "correction_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "multi_agent_runs", "replay_of_run_id", "TEXT")
         _ensure_column(conn, "multi_agent_runs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+        _ensure_column(conn, "multi_agent_runs", "requester_role", "TEXT")
+        _ensure_column(conn, "multi_agent_tasks", "duration_ms", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "agent_memory", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
         _ensure_column(conn, "golden_traces", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
         _ensure_column(conn, "trace_replays", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
@@ -529,6 +617,9 @@ def init_db(seed: bool | None = None) -> None:
         _ensure_column(conn, "tickets", "external_url", "TEXT")
         _ensure_column(conn, "tickets", "idempotency_key", "TEXT")
         _ensure_column(conn, "tickets", "external_payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "tickets", "due_at", "TEXT")
+        _ensure_column(conn, "tickets", "resolved_at", "TEXT")
+        _ensure_column(conn, "tickets", "closed_at", "TEXT")
         _ensure_column(conn, "emails", "provider", "TEXT NOT NULL DEFAULT 'mock'")
         _ensure_column(conn, "emails", "external_message_id", "TEXT")
         _ensure_column(conn, "emails", "error_message", "TEXT")
@@ -544,6 +635,7 @@ def init_db(seed: bool | None = None) -> None:
         _ensure_column(conn, "auth_login_attempts", "lockout_until", "TEXT")
         _ensure_column(conn, "audit_logs", "previous_hash", "TEXT")
         _ensure_column(conn, "audit_logs", "row_hash", "TEXT")
+        _ensure_customer_email_tenant_scope(conn)
         _ensure_indexes(conn)
         _ensure_postgres_rls(conn)
         _record_schema_migration(conn, BASELINE_MIGRATION_ID, BASELINE_MIGRATION_DESCRIPTION)
@@ -556,6 +648,9 @@ def init_db(seed: bool | None = None) -> None:
         _record_schema_migration(conn, POSTGRES_RLS_MIGRATION_ID, POSTGRES_RLS_MIGRATION_DESCRIPTION)
         _record_schema_migration(conn, POSTGRES_RLS_BYPASS_ROLE_MIGRATION_ID, POSTGRES_RLS_BYPASS_ROLE_MIGRATION_DESCRIPTION)
         _record_schema_migration(conn, WORKFLOW_RUN_TICKET_LINK_MIGRATION_ID, WORKFLOW_RUN_TICKET_LINK_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, CRM_FOUNDATION_MIGRATION_ID, CRM_FOUNDATION_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, TICKET_TIMELINE_MIGRATION_ID, TICKET_TIMELINE_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, TICKET_SLA_MIGRATION_ID, TICKET_SLA_MIGRATION_DESCRIPTION)
     if settings.auto_seed if seed is None else seed:
         seed_demo_data(purpose="migration")
 
@@ -734,6 +829,10 @@ def _ensure_indexes(conn: sqlite3.Connection | PostgresConnection) -> None:
             ON multi_agent_runs(tenant_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_multi_agent_messages_run_created
             ON multi_agent_messages(run_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_multi_agent_tasks_run_status
+            ON multi_agent_tasks(run_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_multi_agent_handoffs_run_created
+            ON multi_agent_handoffs(run_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_agent_memory_tenant_created
             ON agent_memory(tenant_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_agent_checkpoints_run_index
@@ -746,12 +845,28 @@ def _ensure_indexes(conn: sqlite3.Connection | PostgresConnection) -> None:
             ON approvals(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_approvals_tenant_status_created
             ON approvals(tenant_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_customers_tenant_updated
+            ON customers(tenant_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_customers_tenant_status_owner
+            ON customers(tenant_id, status, owner_department);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_tenant_email
+            ON customers(tenant_id, email);
+        CREATE INDEX IF NOT EXISTS idx_customer_interactions_customer_created
+            ON customer_interactions(customer_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_customer_interactions_tenant_created
+            ON customer_interactions(tenant_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_tickets_status_updated
             ON tickets(status, updated_at);
         CREATE INDEX IF NOT EXISTS idx_tickets_tenant_status_updated
             ON tickets(tenant_id, status, updated_at);
         CREATE INDEX IF NOT EXISTS idx_tickets_external_id
             ON tickets(external_id);
+        CREATE INDEX IF NOT EXISTS idx_tickets_tenant_due
+            ON tickets(tenant_id, due_at);
+        CREATE INDEX IF NOT EXISTS idx_ticket_events_ticket_created
+            ON ticket_events(ticket_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_ticket_events_tenant_created
+            ON ticket_events(tenant_id, created_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_idempotency_key
             ON tickets(idempotency_key)
             WHERE idempotency_key IS NOT NULL;
@@ -869,6 +984,57 @@ def _ensure_column(conn: sqlite3.Connection | PostgresConnection, table: str, co
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def _ensure_customer_email_tenant_scope(conn: sqlite3.Connection | PostgresConnection) -> None:
+    """Upgrade the legacy global email uniqueness to tenant + email uniqueness."""
+    if is_postgres_connection(conn):
+        conn.execute("ALTER TABLE customers DROP CONSTRAINT IF EXISTS customers_email_key")
+        return
+    unique_email_constraint = False
+    for index in conn.execute("PRAGMA index_list(customers)").fetchall():
+        if not bool(index["unique"]):
+            continue
+        columns = [row["name"] for row in conn.execute(f"PRAGMA index_info({quote_identifier(index['name'])})").fetchall()]
+        if columns == ["email"]:
+            unique_email_constraint = True
+            break
+    if not unique_email_constraint:
+        return
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("PRAGMA legacy_alter_table = ON")
+    conn.executescript(
+        """
+        ALTER TABLE customers RENAME TO customers_legacy_global_email;
+        CREATE TABLE customers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            tenant_id TEXT NOT NULL DEFAULT 'default',
+            tier TEXT NOT NULL DEFAULT 'starter',
+            status TEXT NOT NULL DEFAULT 'active',
+            email TEXT NOT NULL,
+            phone TEXT,
+            health_score INTEGER NOT NULL DEFAULT 100,
+            owner_department TEXT NOT NULL DEFAULT 'Customer Success',
+            owner_user_id TEXT,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO customers
+        (id, name, tenant_id, tier, status, email, phone, health_score, owner_department,
+         owner_user_id, tags_json, metadata_json, notes, created_at, updated_at)
+        SELECT id, name, tenant_id, tier, status, email, phone, health_score, owner_department,
+               owner_user_id, tags_json, metadata_json, notes, created_at, updated_at
+        FROM customers_legacy_global_email;
+        DROP TABLE customers_legacy_global_email;
+        """
+    )
+    conn.execute("PRAGMA legacy_alter_table = OFF")
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
 def reset_database(seed: bool = True) -> None:
     if settings.db_backend == "postgres":
         quoted_schema = quote_identifier(settings.postgres_schema)
@@ -888,12 +1054,15 @@ def clear_run_history() -> dict[str, int]:
         "trace_replays",
         "golden_traces",
         "agent_checkpoints",
+        "multi_agent_handoffs",
+        "multi_agent_tasks",
         "multi_agent_messages",
         "multi_agent_runs",
         "agent_memory",
         "workflow_steps",
         "approvals",
         "emails",
+        "ticket_events",
         "tickets",
         "external_outbox",
         "workflow_jobs",
@@ -1001,8 +1170,8 @@ def seed_demo_data(purpose: str | None = None) -> None:
             conn.execute(
                 """
                 INSERT INTO customers
-                (id, name, tier, email, health_score, notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, name, tenant_id, tier, status, email, health_score, owner_department, notes, created_at, updated_at)
+                VALUES (?, ?, 'default', ?, 'active', ?, ?, 'Customer Success', ?, ?, ?)
                 """,
                 (*customer, now, now),
             )

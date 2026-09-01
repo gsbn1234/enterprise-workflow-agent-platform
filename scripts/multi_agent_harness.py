@@ -10,11 +10,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = ROOT / "data" / "multi_agent_eval.sqlite3"
 os.environ.setdefault("AGENT_DB_PATH", str(DEFAULT_DB))
+os.environ.setdefault("KNOWLEDGE_RAG_BASE_URL", "")
+os.environ.setdefault("AGENT_TOOL_MODE", "mock")
+os.environ.setdefault("AGENT_TICKET_PROVIDER", "mock")
+os.environ.setdefault("AGENT_EMAIL_PROVIDER", "mock")
 sys.path.insert(0, str(ROOT))
 
 from app.db import get_connection, reset_database  # noqa: E402
-from app.services.agent import get_run_detail  # noqa: E402
-from app.services.multi_agent import run_multi_agent  # noqa: E402
+from app.services.agent import decide_approval_and_resume, get_run_detail  # noqa: E402
+from app.services.multi_agent import resume_multi_agent_for_workflow, run_multi_agent  # noqa: E402
 from app.utils import json_dumps, new_id, utc_now  # noqa: E402
 
 
@@ -26,14 +30,15 @@ def load_cases(path: Path) -> list[dict]:
     return cases
 
 
-def score_case(case: dict, run: dict) -> dict:
+def score_case(case: dict, run: dict, *, pre_approval_workflow_status: str | None = None) -> dict:
     messages = run.get("messages", [])
     agent_names = {message["agent_name"] for message in messages}
     expected_agents = set(case.get("expected_agents", []))
     missing_agents = sorted(expected_agents - agent_names)
     workflow = get_run_detail(run["workflow_run_id"]) if run.get("workflow_run_id") else None
     critic_report = run.get("critic_report", {})
-    workflow_status = (workflow or {}).get("status") or critic_report.get("workflow_status")
+    final_workflow_status = (workflow or {}).get("status") or critic_report.get("workflow_status")
+    workflow_status = pre_approval_workflow_status or final_workflow_status
     category = (workflow or {}).get("category")
     needs_approval = bool((workflow or {}).get("needs_approval"))
 
@@ -59,6 +64,7 @@ def score_case(case: dict, run: dict) -> dict:
         "critic_score": float(run.get("critic_score") or 0),
         "critic_findings": critic_report.get("findings", []),
         "workflow_status": workflow_status,
+        "final_workflow_status": final_workflow_status,
         "workflow_category": category,
         "workflow_needs_approval": needs_approval,
         "multi_agent_status": run.get("status"),
@@ -143,7 +149,28 @@ def main() -> None:
             requester_department="QA",
             requester_role="manager",
         )
-        results.append(score_case(case, run))
+        workflow = get_run_detail(run["workflow_run_id"]) if run.get("workflow_run_id") else None
+        pre_approval_status = (workflow or {}).get("status")
+        if run.get("status") == "waiting_approval":
+            approval_id = next(
+                (
+                    message["content"].get("approval_id")
+                    for message in run.get("messages", [])
+                    if message.get("agent_name") == "tool_execution"
+                ),
+                None,
+            )
+            if approval_id:
+                resumed_workflow = decide_approval_and_resume(
+                    approval_id,
+                    True,
+                    "harness-manager",
+                    "Approved by the multi-agent evaluation harness.",
+                )
+                resumed_run = resume_multi_agent_for_workflow(resumed_workflow or {})
+                if resumed_run:
+                    run = resumed_run
+        results.append(score_case(case, run, pre_approval_workflow_status=pre_approval_status))
 
     summary = save_report(results, args.report_prefix)
     print(json.dumps(summary, ensure_ascii=False, indent=2))

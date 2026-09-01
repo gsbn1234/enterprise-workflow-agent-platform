@@ -42,6 +42,22 @@ Docker demo URLs:
 - Local enterprise SSO provider: `http://127.0.0.1:8030`
 - RAG API health: `http://127.0.0.1:8000/health`
 
+Optional Qwen LLM setup:
+
+```powershell
+$env:AGENT_LLM_ENABLED="true"
+$env:AGENT_LLM_PROVIDER="qwen"
+$env:AGENT_LLM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+$env:AGENT_LLM_MODEL="qwen-plus"
+$env:AGENT_LLM_PLANNER_ENABLED="true"
+$env:AGENT_LLM_FINAL_ANSWER_ENABLED="true"
+$env:AGENT_LLM_API_KEY="your-dashscope-api-key"
+python scripts\llm_smoke_test.py --require-call
+docker compose -f docker-compose.prod.yml up -d --build workflow-agent workflow-worker
+```
+
+With Qwen enabled, the plan step shows an `LLM planner` reason when Qwen classified the request, and final user results are formatted as concise Markdown. Backend approval, audit, and tool permission rules still decide whether an action can run.
+
 Useful checks:
 
 ```powershell

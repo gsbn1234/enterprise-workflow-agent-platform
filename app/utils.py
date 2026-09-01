@@ -11,6 +11,11 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def utc_now_precise() -> str:
+    """Return a sortable UTC timestamp precise enough for concurrent task traces."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(8)}"
 

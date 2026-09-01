@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 from app.db import get_connection, row_to_dict, rows_to_dicts
-from app.services.agent import get_run_detail
+from app.services.agent import decide_approval_and_resume, get_run_detail
+from app.services.multi_agent.durable_executor import resume_multi_agent_for_workflow
 from app.services.multi_agent.orchestrator import get_multi_agent_run, run_multi_agent
 from app.services.tenancy import effective_tenant_id
 from app.utils import json_dumps, json_loads, new_id, utc_now
+
+
+TASK_TRACE_ORDER = {
+    "memory.retrieve": 0,
+    "plan.supervisor": 10,
+    "research.enterprise_rag": 20,
+    "research.local_policy": 21,
+    "research.synthesis": 30,
+    "risk.compliance_vote": 40,
+    "risk.operational_vote": 41,
+    "risk.consensus": 50,
+    "action.execute": 60,
+    "approval.resume": 70,
+    "quality.critic": 80,
+    "quality.self_correction": 90,
+    "memory.write": 100,
+}
 
 
 def list_agent_checkpoints(run_id: str) -> list[dict]:
@@ -30,6 +48,11 @@ def export_multi_agent_trace(run_id: str, *, include_payloads: bool = False) -> 
     workflow = get_run_detail(run["workflow_run_id"]) if run.get("workflow_run_id") else None
     checkpoints = list_agent_checkpoints(run_id)
     messages = run.get("messages", [])
+    tasks = sorted(run.get("tasks", []), key=_task_trace_order)
+    handoffs = sorted(
+        run.get("handoffs", []),
+        key=lambda item: (item.get("task_key", ""), item.get("from_agent", ""), item.get("to_agent", "")),
+    )
     workflow_steps = (workflow or {}).get("steps", [])
     trace = {
         "run_id": run["id"],
@@ -50,9 +73,13 @@ def export_multi_agent_trace(run_id: str, *, include_payloads: bool = False) -> 
             "risk_level": (workflow or {}).get("risk_level"),
             "needs_approval": bool((workflow or {}).get("needs_approval")),
         },
-        "agent_sequence": [message["agent_name"] for message in messages],
+        "agent_sequence": [task["assigned_agent"] for task in tasks],
         "agent_roles": [message["role"] for message in messages],
         "agent_statuses": [message["status"] for message in messages],
+        "task_sequence": [f"{task['attempt']}:{task['task_key']}:{task['status']}" for task in tasks],
+        "handoff_edges": [
+            f"{handoff['from_agent']}->{handoff['to_agent']}:{handoff['task_key']}" for handoff in handoffs
+        ],
         "checkpoint_sequence": [checkpoint["node_name"] for checkpoint in checkpoints],
         "tool_sequence": [step.get("tool_name") for step in workflow_steps if step.get("tool_name")],
         "workflow_nodes": [
@@ -69,6 +96,8 @@ def export_multi_agent_trace(run_id: str, *, include_payloads: bool = False) -> 
     }
     if include_payloads:
         trace["messages"] = messages
+        trace["tasks"] = tasks
+        trace["handoffs"] = handoffs
         trace["checkpoints"] = checkpoints
         trace["workflow_steps"] = workflow_steps
     return trace
@@ -170,11 +199,32 @@ def replay_multi_agent_run(source_run_id: str) -> dict:
         source["objective"],
         requester_user_id=source.get("requester_user_id"),
         requester_department=source.get("requester_department"),
+        requester_role=source.get("requester_role"),
         tenant_id=source.get("tenant_id"),
         enable_self_correction=True,
         max_correction_attempts=max(1, int(source.get("correction_count") or 0)),
         replay_of_run_id=source_run_id,
     )
+    source_workflow = get_run_detail(source["workflow_run_id"]) if source.get("workflow_run_id") else None
+    if replay.get("status") == "waiting_approval" and (source_workflow or {}).get("status") != "waiting_approval":
+        approval_id = next(
+            (
+                message["content"].get("approval_id")
+                for message in replay.get("messages", [])
+                if message.get("agent_name") == "tool_execution"
+            ),
+            None,
+        )
+        if approval_id:
+            workflow = decide_approval_and_resume(
+                approval_id,
+                approved=(source_workflow or {}).get("status") != "refused",
+                decided_by="trace-replay",
+                reason="Replay the source run's human-approval outcome.",
+            )
+            resumed = resume_multi_agent_for_workflow(workflow or {})
+            if resumed:
+                replay = resumed
     diff = diff_trace(replay["id"], baseline_run_id=source_run_id)
     replay_id = new_id("replay")
     status = "passed" if diff["passed"] else "failed"
@@ -235,6 +285,8 @@ def _diff_normalized_traces(baseline: dict, current: dict, *, baseline_ref: dict
     _compare_value(differences, "workflow.needs_approval", baseline.get("workflow", {}).get("needs_approval"), current.get("workflow", {}).get("needs_approval"))
     _compare_value(differences, "critic_passed", baseline.get("critic_passed"), current.get("critic_passed"))
     _compare_sequence(differences, "agent_sequence", baseline.get("agent_sequence", []), current.get("agent_sequence", []))
+    _compare_sequence(differences, "task_sequence", baseline.get("task_sequence", []), current.get("task_sequence", []))
+    _compare_sequence(differences, "handoff_edges", baseline.get("handoff_edges", []), current.get("handoff_edges", []))
     _compare_sequence(differences, "tool_sequence", baseline.get("tool_sequence", []), current.get("tool_sequence", []))
     _compare_sequence(differences, "checkpoint_sequence", baseline.get("checkpoint_sequence", []), current.get("checkpoint_sequence", []))
     high = [item for item in differences if item["severity"] == "high"]
@@ -252,6 +304,15 @@ def _diff_normalized_traces(baseline: dict, current: dict, *, baseline_ref: dict
         },
         "differences": differences,
     }
+
+
+def _task_trace_order(task: dict) -> tuple[int, int, str]:
+    task_key = str(task.get("task_key") or "")
+    return (
+        int(task.get("attempt") or 0),
+        TASK_TRACE_ORDER.get(task_key, 999),
+        task_key,
+    )
 
 
 def _compare_value(differences: list[dict], field: str, expected, actual) -> None:

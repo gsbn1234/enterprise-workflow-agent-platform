@@ -4,6 +4,7 @@ from app.config import settings
 from app.db import database_status, get_connection, rows_to_dicts
 from app.services.audit import verify_audit_log_integrity
 from app.services.auth import auth_security_summary
+from app.services.llm import llm_status
 from app.services.metrics import metrics_summary
 from app.services.oidc import oidc_status
 from app.services.observability import observability_status
@@ -248,6 +249,51 @@ def production_warnings() -> list[dict[str, str]]:
                 "message": "Enable AGENT_SCIM_ENABLED=true and configure AGENT_SCIM_TOKEN for enterprise identity lifecycle sync.",
             }
         )
+    if production_like and not settings.rag_base_url:
+        warnings.append(
+            {
+                "code": "enterprise_rag_not_configured",
+                "severity": "high",
+                "message": "Configure KNOWLEDGE_RAG_BASE_URL before production launch.",
+            }
+        )
+    if production_like and settings.rag_base_url and (
+        not settings.rag_service_token
+        or len(settings.rag_service_token) < 32
+        or "replace" in settings.rag_service_token.lower()
+    ):
+        warnings.append(
+            {
+                "code": "rag_service_token_weak",
+                "severity": "high",
+                "message": "Configure a long random KNOWLEDGE_RAG_SERVICE_TOKEN shared only with the RAG service.",
+            }
+        )
+    llm = llm_status()
+    if production_like and not llm["enabled"]:
+        warnings.append(
+            {
+                "code": "llm_disabled",
+                "severity": "medium",
+                "message": "Enable AGENT_LLM_ENABLED=true for LLM planner and final-answer generation.",
+            }
+        )
+    if llm["enabled"] and llm.get("api_key_required", True) and not llm["api_key_configured"]:
+        warnings.append(
+            {
+                "code": "llm_api_key_missing",
+                "severity": "high",
+                "message": "AGENT_LLM_ENABLED=true requires AGENT_LLM_API_KEY or DASHSCOPE_API_KEY.",
+            }
+        )
+    if llm["enabled"] and not llm["model"]:
+        warnings.append(
+            {
+                "code": "llm_model_missing",
+                "severity": "high",
+                "message": "AGENT_LLM_ENABLED=true requires AGENT_LLM_MODEL, for example qwen-plus.",
+            }
+        )
     if settings.scim_enabled and (
         not settings.scim_token or len(settings.scim_token) < 32 or "replace" in settings.scim_token.lower()
     ):
@@ -468,6 +514,7 @@ def operations_dashboard() -> dict:
         },
         "observability": observability_status(),
         "oidc": oidc_status(),
+        "llm": llm_status(),
         "scim": {
             "enabled": settings.scim_enabled,
             "token_configured": bool(settings.scim_token),

@@ -1,4 +1,5 @@
 from app.services.multi_agent.orchestrator import get_multi_agent_run, list_multi_agent_runs, run_multi_agent
+from app.services.multi_agent.durable_executor import resume_multi_agent_for_workflow
 from app.services.multi_agent.trace_tools import (
     diff_trace,
     export_multi_agent_trace,
@@ -19,5 +20,6 @@ __all__ = [
     "list_trace_replays",
     "replay_multi_agent_run",
     "run_multi_agent",
+    "resume_multi_agent_for_workflow",
     "save_golden_trace",
 ]

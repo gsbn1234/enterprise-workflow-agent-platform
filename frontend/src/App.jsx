@@ -731,6 +731,7 @@ function AdminConsole({ user, onMessage }) {
 
   const loadArtifacts = useCallback(async () => {
     const endpoints = {
+      customers: "/api/customers?limit=50",
       tickets: "/api/tickets?limit=20",
       emails: "/api/emails?limit=20",
       knowledge: "/api/knowledge?limit=20",
@@ -915,6 +916,7 @@ function AdminConsole({ user, onMessage }) {
             value={tab}
             onChange={setTab}
             items={[
+              ["customers", Users, "CRM"],
               ["tickets", Ticket, "工单"],
               ["emails", Mail, "邮件"],
               ["knowledge", Database, "知识"],
@@ -922,6 +924,7 @@ function AdminConsole({ user, onMessage }) {
               ["outbox", Archive, "Outbox"],
             ]}
           />
+          {tab === "customers" ? <CustomerCreatePanel onCreated={loadArtifacts} onMessage={onMessage} /> : null}
           <div className="artifact-grid">
             {artifacts.length ? artifacts.map((item) => <ArtifactCard key={item.id || item.created_at || item.title} item={item} type={tab} />) : <Empty text="暂无数据" />}
           </div>
@@ -1762,6 +1765,8 @@ function Status({ value }) {
 
 function RunCard({ run, admin = false, onReplay }) {
   const agents = run.messages || [];
+  const tasks = run.tasks || [];
+  const handoffs = run.handoffs || [];
   return (
     <article className="record-card">
       <div className="record-head">
@@ -1772,6 +1777,23 @@ function RunCard({ run, admin = false, onReplay }) {
         {run.id} · critic={Number(run.critic_score || 0).toFixed(0)} · {run.latency_ms || 0}ms
       </div>
       <p>{formatRunSummary(run)}</p>
+      {tasks.length ? (
+        <div className="agent-steps">
+          <div className="muted">任务图 · {tasks.length} tasks · {handoffs.length} handoffs</div>
+          {tasks.map((task) => (
+            <div className="agent-step" key={task.id}>
+              <div>
+                <code>{task.task_key}</code>
+                <Status value={task.status} />
+              </div>
+              <span>
+                {task.assigned_agent}
+                {(task.dependencies || []).length ? ` ← ${(task.dependencies || []).join(", ")}` : ""}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
       <div className="agent-steps">
         {agents.map((message) => (
           <div className="agent-step" key={message.id}>
@@ -1973,18 +1995,65 @@ function extractObjectiveFromTicketDescription(description) {
   return (match ? match[1] : text).trim();
 }
 
+function CustomerCreatePanel({ onCreated, onMessage }) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [tier, setTier] = useState("starter");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (!name.trim() || !email.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/customers", {
+        method: "POST",
+        body: JSON.stringify({ name: name.trim(), email: email.trim(), tier }),
+      });
+      setName("");
+      setEmail("");
+      setTier("starter");
+      onMessage("客户档案已创建");
+      await onCreated();
+    } catch (error) {
+      onMessage(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form className="ticket-ops customer-create" onSubmit={submit}>
+      <input value={name} onChange={(event) => setName(event.target.value)} placeholder="customer name" maxLength={200} />
+      <input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="email" type="email" maxLength={320} />
+      <select value={tier} onChange={(event) => setTier(event.target.value)}>
+        {["starter", "growth", "enterprise", "strategic"].map((value) => <option key={value} value={value}>{value}</option>)}
+      </select>
+      <button className="action-button" type="submit" disabled={busy || !name.trim() || !email.trim()}>Create customer</button>
+    </form>
+  );
+}
+
 function ArtifactCard({ item, type }) {
   const [ticketStatus, setTicketStatus] = useState(item.status || "open");
   const [ticketOwner, setTicketOwner] = useState(item.owner_department || "Business Ops");
   const [ticketPriority, setTicketPriority] = useState(item.priority || "normal");
   const [ticketComment, setTicketComment] = useState("");
   const [ticketBusy, setTicketBusy] = useState(false);
+  const [customerStatus, setCustomerStatus] = useState(item.status || "active");
+  const [customerHealth, setCustomerHealth] = useState(item.health_score ?? 100);
+  const [customerNote, setCustomerNote] = useState("");
 
   useEffect(() => {
     setTicketStatus(item.status || "open");
     setTicketOwner(item.owner_department || "Business Ops");
     setTicketPriority(item.priority || "normal");
   }, [item.id, item.status, item.owner_department, item.priority]);
+
+  useEffect(() => {
+    setCustomerStatus(item.status || "active");
+    setCustomerHealth(item.health_score ?? 100);
+  }, [item.id, item.status, item.health_score]);
 
   const updateTicketFromCard = async () => {
     if (type !== "tickets" || !item.id) return;
@@ -2005,6 +2074,52 @@ function ArtifactCard({ item, type }) {
       setTicketBusy(false);
     }
   };
+
+  const updateCustomerFromCard = async () => {
+    if (type !== "customers" || !item.id) return;
+    setTicketBusy(true);
+    try {
+      await api(`/api/customers/${item.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: customerStatus, health_score: Number(customerHealth) }),
+      });
+      if (customerNote.trim()) {
+        await api(`/api/customers/${item.id}/interactions`, {
+          method: "POST",
+          body: JSON.stringify({ summary: customerNote.trim(), interaction_type: "note", channel: "admin-console" }),
+        });
+      }
+      setCustomerNote("");
+      emitRefreshSignal("customer_updated");
+    } finally {
+      setTicketBusy(false);
+    }
+  };
+
+  if (type === "customers") {
+    return (
+      <article className="record-card">
+        <div className="record-head">
+          <strong>{item.name}</strong>
+          <Status value={item.status} />
+        </div>
+        <div className="muted">{item.email} · {item.tier} · {item.owner_department}</div>
+        <div className={`ticket-sla ${Number(item.health_score) < 50 ? "danger" : Number(item.health_score) < 75 ? "warn" : "ok"}`}>
+          <span>Health</span><strong>{item.health_score}/100</strong>
+        </div>
+        <div className="ticket-ops">
+          <select value={customerStatus} onChange={(event) => setCustomerStatus(event.target.value)}>
+            {["active", "onboarding", "at_risk", "inactive", "churned"].map((value) => <option key={value} value={value}>{value}</option>)}
+          </select>
+          <input type="number" min="0" max="100" value={customerHealth} onChange={(event) => setCustomerHealth(event.target.value)} />
+          <input value={customerNote} onChange={(event) => setCustomerNote(event.target.value)} placeholder="add interaction note" />
+          <button className="action-button secondary" type="button" disabled={ticketBusy} onClick={updateCustomerFromCard}>Update</button>
+        </div>
+        {item.tags?.length ? <p>Tags: {item.tags.join(", ")}</p> : null}
+        {item.notes ? <p>{short(item.notes, 220)}</p> : null}
+      </article>
+    );
+  }
 
   if (type === "tickets") {
     return (
@@ -2157,12 +2272,18 @@ function Empty({ text }) {
 }
 
 function ticketSla(ticket) {
+  if (ticket.sla) {
+    if (ticket.sla.breached) return { label: "breached", state: "danger" };
+    if (ticket.sla.state === "met") return { label: "met", state: "ok" };
+    if (ticket.sla.due_at) {
+      const due = new Date(ticket.sla.due_at);
+      return { label: Number.isNaN(due.getTime()) ? "active" : `due ${due.toLocaleString()}`, state: "ok" };
+    }
+  }
   const status = String(ticket.status || "open");
-  const priority = String(ticket.priority || "normal");
-  if (["approved", "resolved", "closed", "rejected"].includes(status)) return { label: "done", state: "ok" };
-  if (priority === "urgent" || priority === "high" || ticket.risk_level === "high") return { label: "4h watch", state: "danger" };
+  if (["resolved", "closed", "rejected"].includes(status)) return { label: "done", state: "ok" };
   if (status === "waiting_approval") return { label: "approval", state: "warn" };
-  return { label: "normal", state: "ok" };
+  return { label: "not set", state: "warn" };
 }
 
 function formatScore(value) {

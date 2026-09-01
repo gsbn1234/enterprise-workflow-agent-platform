@@ -1,0 +1,79 @@
+services:
+  vllm:
+    image: "${VLLM_IMAGE:-vllm/vllm-openai:latest}"
+    profiles: ["gpu"]
+    ipc: host
+    gpus: all
+    command:
+      - "--model"
+      - "${VLLM_MODEL:-Qwen/Qwen2.5-32B-Instruct-AWQ}"
+      - "--served-model-name"
+      - "${VLLM_SERVED_MODEL_NAME:-Qwen/Qwen2.5-32B-Instruct-AWQ}"
+      - "--quantization"
+      - "awq"
+      - "--tensor-parallel-size"
+      - "${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+      - "--gpu-memory-utilization"
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+      - "--max-model-len"
+      - "${VLLM_MAX_MODEL_LEN:-16384}"
+    environment:
+      HUGGING_FACE_HUB_TOKEN: "${HUGGING_FACE_HUB_TOKEN:-}"
+    ports:
+      - "${VLLM_HOST_PORT:-8001}:8000"
+    volumes:
+      - vllm_hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
+    restart: unless-stopped
+
+  workflow-agent:
+    depends_on:
+      vllm:
+        condition: service_healthy
+    environment:
+      AGENT_LLM_ENABLED: "true"
+      AGENT_LLM_PROVIDER: "vllm"
+      AGENT_LLM_BASE_URL: "http://vllm:8000/v1"
+      AGENT_LLM_API_KEY: "${VLLM_API_KEY:-}"
+      AGENT_LLM_MODEL: "${VLLM_SERVED_MODEL_NAME:-Qwen/Qwen2.5-32B-Instruct-AWQ}"
+      AGENT_LLM_PLANNER_ENABLED: "true"
+      AGENT_LLM_FINAL_ANSWER_ENABLED: "true"
+      AGENT_LLM_MULTI_AGENT_REASONING_ENABLED: "true"
+
+  workflow-worker:
+    depends_on:
+      vllm:
+        condition: service_healthy
+    environment:
+      AGENT_LLM_ENABLED: "true"
+      AGENT_LLM_PROVIDER: "vllm"
+      AGENT_LLM_BASE_URL: "http://vllm:8000/v1"
+      AGENT_LLM_API_KEY: "${VLLM_API_KEY:-}"
+      AGENT_LLM_MODEL: "${VLLM_SERVED_MODEL_NAME:-Qwen/Qwen2.5-32B-Instruct-AWQ}"
+      AGENT_LLM_PLANNER_ENABLED: "true"
+      AGENT_LLM_FINAL_ANSWER_ENABLED: "true"
+      AGENT_LLM_MULTI_AGENT_REASONING_ENABLED: "true"
+
+  rag-app:
+    depends_on:
+      vllm:
+        condition: service_healthy
+    environment:
+      RAG_LLM_PROVIDER: "vllm"
+      VLLM_BASE_URL: "http://vllm:8000/v1"
+      VLLM_API_KEY: "${VLLM_API_KEY:-}"
+      VLLM_CHAT_MODEL: "${VLLM_SERVED_MODEL_NAME:-Qwen/Qwen2.5-32B-Instruct-AWQ}"
+
+volumes:
+  vllm_hf_cache:

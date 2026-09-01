@@ -1,13 +1,29 @@
 from __future__ import annotations
 
+import logging
 import re
 
 from app.config import settings
 from app.services.agent.state import PlanDecision
 from app.services.agent.ticket_commands import parse_ticket_command
+from app.services.llm import LLMError, complete_json, llm_ready
 
 
 EMAIL_RE = re.compile(r"[\w.\-+]+@[\w.\-]+\.\w+")
+ALLOWED_CATEGORIES = {
+    "refund",
+    "complaint",
+    "communication",
+    "security",
+    "access_request",
+    "remote_work",
+    "procurement",
+    "incident",
+    "general",
+}
+ALLOWED_PRIORITIES = {"low", "normal", "high", "critical"}
+
+logger = logging.getLogger("agent_platform.planner")
 AMOUNT_RE = re.compile(r"(?:￥|¥|\$)?\s*(\d+(?:\.\d+)?)\s*(?:元|rmb|RMB|usd|USD|美元)?")
 
 
@@ -60,6 +76,9 @@ def plan_workflow(objective: str) -> PlanDecision:
             final_ticket_status=ticket_command.status or "unchanged",
             approval_action="none",
         )
+    llm_plan = _llm_plan(objective)
+    if llm_plan:
+        return llm_plan
     category = _classify_category(objective)
     amount = _extract_amount(objective)
     recipient = _extract_email(objective)
@@ -98,6 +117,128 @@ def plan_workflow(objective: str) -> PlanDecision:
         final_ticket_status=policy["final_ticket_status"],
         approval_action=policy["approval_action"],
     )
+
+
+def _llm_plan(objective: str) -> PlanDecision | None:
+    if not settings.llm_planner_enabled or not llm_ready():
+        return None
+    try:
+        suggestion = complete_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You classify user requests for a safe enterprise AI agent. "
+                        "Return JSON only. Do not execute tools or approve actions. "
+                        "Allowed categories: refund, complaint, communication, security, "
+                        "access_request, remote_work, procurement, incident, general. "
+                        "Allowed priorities: low, normal, high, critical. "
+                        "Use null when amount or recipient_email is absent."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Request: {objective}\n\n"
+                        "Return JSON with keys: category, priority, amount, recipient_email, "
+                        "recommended_owner, confidence, explanation."
+                    ),
+                },
+            ],
+            temperature=0,
+            max_tokens=450,
+        )
+    except LLMError as exc:
+        logger.warning("llm.planner_failed", extra={"event": "llm.planner_failed", "error": str(exc)})
+        return None
+
+    confidence = _safe_float(suggestion.get("confidence"), 0.0)
+    if confidence < settings.llm_planner_min_confidence:
+        return None
+
+    category = str(suggestion.get("category") or "").strip().lower()
+    if category not in ALLOWED_CATEGORIES:
+        category = _classify_category(objective)
+    priority = str(suggestion.get("priority") or "").strip().lower()
+    if priority not in ALLOWED_PRIORITIES:
+        priority = _priority(objective, category)
+    if priority == "critical":
+        priority = "high"
+
+    amount = _safe_amount(suggestion.get("amount"), _extract_amount(objective))
+    recipient = _safe_email(suggestion.get("recipient_email")) or _extract_email(objective)
+    owner = str(suggestion.get("recommended_owner") or "").strip() or _owner_department(category, priority)
+    if len(owner) > 80:
+        owner = _owner_department(category, priority)
+
+    risk_level = _risk_level(category, amount, objective)
+    needs_approval = _needs_approval(category, amount, recipient, risk_level)
+    policy = _workflow_policy(category, amount, recipient, risk_level)
+    proposed_tools = _proposed_tools(category, recipient, needs_approval)
+    explanation = str(suggestion.get("explanation") or "").strip()
+    deterministic_reason = _reason(category, amount, risk_level, needs_approval, policy["workflow_type"], policy["approval_chain"])
+    reason = (
+        f"LLM planner ({settings.llm_provider}/{settings.llm_model}, confidence={confidence:.2f}) "
+        f"suggested {category}. {explanation} Safety policy: {deterministic_reason}"
+    )
+
+    return PlanDecision(
+        category=category,
+        priority=priority,
+        risk_level=risk_level,
+        needs_approval=needs_approval,
+        amount=amount,
+        recipient_email=recipient,
+        recommended_owner=owner,
+        reason=reason,
+        proposed_tools=proposed_tools,
+        workflow_type=policy["workflow_type"],
+        approval_chain=policy["approval_chain"],
+        blocked_actions=policy["blocked_actions"],
+        auto_actions=policy["auto_actions"],
+        final_ticket_status=policy["final_ticket_status"],
+        approval_action=policy["approval_action"],
+    )
+
+
+def _proposed_tools(category: str, recipient: str | None, needs_approval: bool) -> list[str]:
+    proposed_tools = ["query_enterprise_rag", "search_knowledge", "create_ticket"]
+    if category in {"refund", "complaint", "communication"}:
+        proposed_tools.insert(0, "lookup_customer")
+        proposed_tools.append("draft_email")
+    if category in {"security", "access_request", "incident"}:
+        proposed_tools.append("notify_internal_team")
+    if needs_approval:
+        proposed_tools.append("request_approval")
+    elif recipient:
+        proposed_tools.append("send_email")
+    return proposed_tools
+
+
+def _safe_float(value: object, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_amount(value: object, default: float | None) -> float | None:
+    if value is None or value == "":
+        return default
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return default
+    if amount < 0 or amount > 100000000:
+        return default
+    return amount
+
+
+def _safe_email(value: object) -> str | None:
+    if not value:
+        return None
+    match = EMAIL_RE.search(str(value))
+    return match.group(0) if match else None
 
 
 def _classify_category(text: str) -> str:

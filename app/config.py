@@ -126,6 +126,24 @@ class Settings:
     workflow_job_retention_days: int = int(os.getenv("AGENT_WORKFLOW_JOB_RETENTION_DAYS", "0"))
     login_attempt_retention_days: int = int(os.getenv("AGENT_LOGIN_ATTEMPT_RETENTION_DAYS", "0"))
     rag_base_url: str = os.getenv("KNOWLEDGE_RAG_BASE_URL", "").rstrip("/")
+    rag_service_token: str = os.getenv("KNOWLEDGE_RAG_SERVICE_TOKEN", "").strip()
+    rag_timeout_seconds: float = float(os.getenv("KNOWLEDGE_RAG_TIMEOUT_SECONDS", "8"))
+
+    llm_enabled: bool = _bool_env("AGENT_LLM_ENABLED", False)
+    llm_provider: str = os.getenv("AGENT_LLM_PROVIDER", "qwen").strip().lower()
+    llm_base_url: str = os.getenv("AGENT_LLM_BASE_URL", "").rstrip("/")
+    llm_api_key: str = os.getenv("AGENT_LLM_API_KEY", os.getenv("DASHSCOPE_API_KEY", "")).strip()
+    llm_model: str = os.getenv("AGENT_LLM_MODEL", "qwen-plus").strip()
+    llm_timeout_seconds: float = float(os.getenv("AGENT_LLM_TIMEOUT_SECONDS", "30"))
+    llm_temperature: float = float(os.getenv("AGENT_LLM_TEMPERATURE", "0.2"))
+    llm_max_tokens: int = int(os.getenv("AGENT_LLM_MAX_TOKENS", "900"))
+    llm_planner_enabled: bool = _bool_env("AGENT_LLM_PLANNER_ENABLED", llm_enabled)
+    llm_final_answer_enabled: bool = _bool_env("AGENT_LLM_FINAL_ANSWER_ENABLED", llm_enabled)
+    llm_multi_agent_reasoning_enabled: bool = _bool_env(
+        "AGENT_LLM_MULTI_AGENT_REASONING_ENABLED",
+        llm_enabled,
+    )
+    llm_planner_min_confidence: float = float(os.getenv("AGENT_LLM_PLANNER_MIN_CONFIDENCE", "0.55"))
 
     tool_mode: str = os.getenv("AGENT_TOOL_MODE", "mock").strip().lower()
 
@@ -162,6 +180,8 @@ if settings.log_format not in {"plain", "json"}:
     raise ValueError("AGENT_LOG_FORMAT must be 'plain' or 'json'.")
 if settings.queue_backend not in {"db", "redis"}:
     raise ValueError("AGENT_QUEUE_BACKEND must be 'db' or 'redis'.")
+if settings.llm_provider not in {"qwen", "vllm", "openai_compatible", "openai-compatible"}:
+    raise ValueError("AGENT_LLM_PROVIDER must be 'qwen', 'vllm', or 'openai_compatible'.")
 if not settings.db_path.is_absolute():
     settings.db_path = BASE_DIR / settings.db_path
 settings.db_path.parent.mkdir(parents=True, exist_ok=True)

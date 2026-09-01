@@ -7,6 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ["AGENT_DB_PATH"] = str(ROOT / "data" / "trace_replay_smoke_test.sqlite3")
+os.environ["KNOWLEDGE_RAG_BASE_URL"] = ""
+os.environ["AGENT_TOOL_MODE"] = "mock"
+os.environ["AGENT_TICKET_PROVIDER"] = "mock"
+os.environ["AGENT_EMAIL_PROVIDER"] = "mock"
 sys.path.insert(0, str(ROOT))
 
 from app.db import reset_database  # noqa: E402

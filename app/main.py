@@ -22,10 +22,14 @@ from app.schemas import (
     AuthLoginRequest,
     AuthTokenOut,
     BusinessRequestCreate,
+    CustomerCreate,
+    CustomerInteractionCreate,
+    CustomerUpdate,
     GoldenTraceCreate,
     GoldenTraceDiffRequest,
     KnowledgeArticleCreate,
     MultiAgentRunRequest,
+    TicketCommentCreate,
     TicketOpsRequest,
     ToolCallRequest,
     TraceReplayRequest,
@@ -48,6 +52,7 @@ from app.services.auth import (
 )
 from app.services.eval_reports import list_eval_reports
 from app.services.jobs import create_workflow_job, get_workflow_job, list_workflow_jobs, process_next_job, retry_workflow_job
+from app.services.llm import llm_status
 from app.services.metrics import metrics_summary, prometheus_metrics
 from app.services.multi_agent import (
     diff_trace,
@@ -58,6 +63,7 @@ from app.services.multi_agent import (
     list_multi_agent_runs,
     list_trace_replays,
     replay_multi_agent_run,
+    resume_multi_agent_for_workflow,
     run_multi_agent,
     save_golden_trace,
 )
@@ -94,11 +100,25 @@ from app.services.scim import (
 )
 from app.services.demo import list_demo_scenarios
 from app.services.tools.approvals import get_approval, list_approvals
-from app.services.tools.crm import list_customers
+from app.services.tools.crm import (
+    add_customer_interaction,
+    create_customer,
+    get_customer,
+    list_customer_interactions,
+    list_customers,
+    update_customer,
+)
 from app.services.tools.email import list_emails
 from app.services.tools.knowledge import create_article, list_articles, search_knowledge
 from app.services.tools.registry import call_tool, list_tool_specs
-from app.services.tools.ticketing import get_ticket, list_tickets, update_ticket
+from app.services.tools.ticketing import (
+    add_ticket_comment,
+    get_ticket,
+    list_ticket_events,
+    list_tickets,
+    query_tickets,
+    update_ticket,
+)
 from app.services.tracing import build_trace_context
 from app.services.tenancy import (
     effective_tenant_id,
@@ -272,6 +292,7 @@ def health() -> dict:
         },
         "queue": queue_status(check_connection=False),
         "oidc": oidc_status(),
+        "llm": llm_status(),
     }
 
 
@@ -286,6 +307,7 @@ def readiness() -> dict:
         "operations": operations_status(),
         "observability": observability_status(),
         "queue": queue_status(check_connection=True),
+        "llm": llm_status(),
         "rag": "configured" if settings.rag_base_url else "not_configured",
     }
 
@@ -354,8 +376,9 @@ def _event_snapshot(auth_context: AuthContext | None) -> dict:
             "ticket_provider": settings.ticket_provider or settings.tool_mode or "mock",
             "email_provider": settings.email_provider or settings.tool_mode or "mock",
             "rag": "connected" if settings.rag_base_url else "not_configured",
+            "llm": llm_status(),
         },
-        "metrics": metrics_summary(),
+        "metrics": metrics_summary(_tenant_scope(auth_context)),
         "approvals": _compact_records(
             _scoped_approvals(status="pending", limit=10, auth_context=auth_context) if can_approve else [],
             ("id", "run_id", "tool_name", "status", "created_at"),
@@ -423,6 +446,23 @@ def _ensure_approver_when_auth_required(auth_context: AuthContext | None) -> Non
         raise HTTPException(status_code=403, detail="Manager or admin role is required.")
 
 
+def _ensure_crm_access(auth_context: AuthContext | None, *, manage: bool = False) -> None:
+    if not settings.auth_required:
+        return
+    if not auth_context:
+        raise HTTPException(status_code=401, detail="Authentication is required.")
+    if auth_context.is_admin:
+        return
+    if auth_context.department != "Customer Success":
+        raise HTTPException(status_code=403, detail="CRM access is limited to Customer Success or administrators.")
+    if manage and not auth_context.can_approve:
+        raise HTTPException(status_code=403, detail="Customer Success manager or admin role is required.")
+
+
+def _crm_tenant_scope(auth_context: AuthContext | None) -> str:
+    return auth_context.tenant_id if auth_context else effective_tenant_id()
+
+
 def _approval_visible_to_context(approval: dict, auth_context: AuthContext | None) -> bool:
     if not settings.auth_required or not auth_context:
         return True
@@ -484,7 +524,8 @@ def _ensure_can_decide_approval(approval_id: str, auth_context: AuthContext | No
 
 
 def _ensure_can_operate_ticket(ticket_id: str, auth_context: AuthContext | None) -> dict:
-    _ensure_approver_when_auth_required(auth_context)
+    if settings.auth_required and not auth_context:
+        raise HTTPException(status_code=401, detail="Authentication is required.")
     ticket = get_ticket(ticket_id)
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found.")
@@ -1070,6 +1111,11 @@ def decide_approval(
     )
     if not run:
         raise HTTPException(status_code=404, detail="Approval not found.")
+    resumed_multi_agent = None
+    if run.get("status") != "waiting_approval":
+        resumed_multi_agent = resume_multi_agent_for_workflow(run)
+    if resumed_multi_agent:
+        run["multi_agent_run"] = resumed_multi_agent
     return run
 
 
@@ -1090,18 +1136,189 @@ def search_policy(q: str, limit: int = 3, auth_context: AuthContext | None = Dep
 
 
 @app.get("/api/customers")
-def customers(limit: int = 100, auth_context: AuthContext | None = Depends(_optional_auth_context)) -> list[dict]:
-    return list_customers(limit)
+def customers(
+    q: str | None = None,
+    status: str | None = None,
+    tier: str | None = None,
+    owner_department: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> list[dict]:
+    _ensure_crm_access(auth_context)
+    try:
+        return list_customers(
+            limit,
+            tenant_id=_crm_tenant_scope(auth_context),
+            q=q,
+            status=status,
+            tier=tier,
+            owner_department=owner_department,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/customers", status_code=201)
+def add_customer(
+    request: CustomerCreate,
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> dict:
+    _ensure_crm_access(auth_context, manage=True)
+    try:
+        return create_customer(
+            **request.model_dump(),
+            tenant_id=_crm_tenant_scope(auth_context),
+            actor=auth_context.user_id if auth_context else "crm-api",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/customers/{customer_id}")
+def customer_detail(
+    customer_id: str,
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> dict:
+    _ensure_crm_access(auth_context)
+    customer = get_customer(customer_id, tenant_id=_crm_tenant_scope(auth_context))
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found.")
+    customer["interactions"] = list_customer_interactions(
+        customer_id,
+        tenant_id=_crm_tenant_scope(auth_context),
+        limit=50,
+    )
+    return customer
+
+
+@app.patch("/api/customers/{customer_id}")
+def edit_customer(
+    customer_id: str,
+    request: CustomerUpdate,
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> dict:
+    _ensure_crm_access(auth_context, manage=True)
+    try:
+        customer = update_customer(
+            customer_id,
+            **request.model_dump(exclude_unset=True),
+            tenant_id=_crm_tenant_scope(auth_context),
+            actor=auth_context.user_id if auth_context else "crm-api",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found.")
+    return customer
+
+
+@app.get("/api/customers/{customer_id}/interactions")
+def customer_interactions(
+    customer_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> list[dict]:
+    _ensure_crm_access(auth_context)
+    tenant_id = _crm_tenant_scope(auth_context)
+    if not get_customer(customer_id, tenant_id=tenant_id):
+        raise HTTPException(status_code=404, detail="Customer not found.")
+    return list_customer_interactions(customer_id, tenant_id=tenant_id, limit=limit, offset=offset)
+
+
+@app.post("/api/customers/{customer_id}/interactions", status_code=201)
+def add_customer_timeline_event(
+    customer_id: str,
+    request: CustomerInteractionCreate,
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> dict:
+    _ensure_crm_access(auth_context)
+    try:
+        return add_customer_interaction(
+            customer_id,
+            **request.model_dump(),
+            tenant_id=_crm_tenant_scope(auth_context),
+            actor=auth_context.user_id if auth_context else "crm-api",
+        )
+    except ValueError as exc:
+        message = str(exc)
+        status_code = 404 if "not found" in message.lower() else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
 
 
 @app.get("/api/tickets")
-def tickets(limit: int = 100, auth_context: AuthContext | None = Depends(_optional_auth_context)) -> list[dict]:
-    tickets = list_tickets(limit, tenant_id=_tenant_scope(auth_context))
+def tickets(
+    status: str | None = None,
+    priority: str | None = None,
+    owner_department: str | None = None,
+    q: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> list[dict]:
+    try:
+        tickets = list_tickets(
+            limit,
+            tenant_id=_tenant_scope(auth_context),
+            offset=offset,
+        ) if not any([status, priority, owner_department, q]) else query_tickets(
+            status=status,
+            priority=priority,
+            owner_department=owner_department,
+            q=q,
+            tenant_id=_tenant_scope(auth_context),
+            limit=limit,
+            offset=offset,
+        )["tickets"]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if settings.auth_required and auth_context and not auth_context.is_admin:
-        if auth_context.can_approve:
-            return [ticket for ticket in tickets if ticket.get("owner_department") == auth_context.department]
-        return []
+        return [ticket for ticket in tickets if ticket.get("owner_department") == auth_context.department]
     return tickets
+
+
+@app.get("/api/tickets/{ticket_id}")
+def ticket_detail_api(
+    ticket_id: str,
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> dict:
+    ticket = dict(_ensure_can_operate_ticket(ticket_id, auth_context))
+    ticket["events"] = list_ticket_events(ticket_id, tenant_id=_tenant_scope(auth_context), limit=200)
+    return ticket
+
+
+@app.get("/api/tickets/{ticket_id}/events")
+def ticket_timeline_api(
+    ticket_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> list[dict]:
+    _ensure_can_operate_ticket(ticket_id, auth_context)
+    return list_ticket_events(ticket_id, tenant_id=_tenant_scope(auth_context), limit=limit, offset=offset)
+
+
+@app.post("/api/tickets/{ticket_id}/comments", status_code=201)
+def ticket_comment_api(
+    ticket_id: str,
+    request: TicketCommentCreate,
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> dict:
+    _ensure_can_operate_ticket(ticket_id, auth_context)
+    try:
+        return add_ticket_comment(
+            ticket_id,
+            request.body,
+            actor=auth_context.user_id if auth_context else "ticket-api",
+            tenant_id=_tenant_scope(auth_context),
+        )
+    except ValueError as exc:
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=f"External ticket sync failed; the Outbox event can be retried: {exc}") from exc
 
 
 @app.patch("/api/tickets/{ticket_id}/ops")
@@ -1111,14 +1328,22 @@ def ticket_ops(
     auth_context: AuthContext | None = Depends(_optional_auth_context),
 ) -> dict:
     _ensure_can_operate_ticket(ticket_id, auth_context)
-    ticket = update_ticket(
-        ticket_id,
-        status=request.status,
-        owner_department=request.owner_department,
-        priority=request.priority,
-        comment=request.comment or "Ticket updated from Agent admin console.",
-        actor=auth_context.user_id if auth_context else "admin-console",
-    )
+    if settings.auth_required and request.status in {"approved", "rejected"} and auth_context and not auth_context.can_approve:
+        raise HTTPException(status_code=403, detail="Manager or admin role is required for approval status changes.")
+    try:
+        ticket = update_ticket(
+            ticket_id,
+            status=request.status,
+            owner_department=request.owner_department,
+            priority=request.priority,
+            comment=request.comment or "Ticket updated from Agent admin console.",
+            actor=auth_context.user_id if auth_context else "admin-console",
+            tenant_id=_tenant_scope(auth_context),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=f"External ticket sync failed; the Outbox event can be retried: {exc}") from exc
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found.")
     return ticket
@@ -1137,7 +1362,7 @@ def audit_logs(limit: int = 100, auth_context: AuthContext | None = Depends(_opt
 
 @app.get("/api/metrics/summary")
 def metrics(auth_context: AuthContext | None = Depends(_optional_auth_context)) -> dict:
-    return metrics_summary()
+    return metrics_summary(_tenant_scope(auth_context))
 
 
 @app.get("/api/eval-reports")
@@ -1159,9 +1384,10 @@ def mcp_call(request: ToolCallRequest, auth_context: AuthContext | None = Depend
     _ensure_admin_when_auth_required(auth_context)
     arguments = dict(request.arguments)
     tenant_id = _tenant_scope(auth_context)
-    if tenant_id and request.tool_name in {"create_ticket", "query_tickets", "request_approval", "notify_internal_team"}:
+    if tenant_id and request.tool_name in {"lookup_customer", "create_ticket", "query_tickets", "request_approval", "notify_internal_team"}:
         arguments.setdefault("tenant_id", tenant_id)
     if request.tool_name == "update_ticket" and tenant_id:
+        arguments.setdefault("tenant_id", tenant_id)
         ticket_id = arguments.get("ticket_id")
         ticket = get_ticket(ticket_id) if ticket_id else None
         if not ticket or not _row_visible_to_context(ticket, auth_context):

@@ -85,10 +85,55 @@ class ApprovalDecisionRequest(BaseModel):
 
 
 class TicketOpsRequest(BaseModel):
-    status: str | None = None
-    owner_department: str | None = None
-    priority: str | None = None
-    comment: str | None = None
+    status: str | None = Field(
+        default=None,
+        pattern="^(open|investigating|waiting_approval|approved|rejected|waiting_customer|resolved|closed)$",
+    )
+    owner_department: str | None = Field(default=None, min_length=1, max_length=120)
+    priority: str | None = Field(default=None, pattern="^(low|normal|high|urgent)$")
+    comment: str | None = Field(default=None, max_length=5000)
+
+
+class TicketCommentCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=5000)
+
+
+class CustomerCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    email: str = Field(min_length=3, max_length=320)
+    tier: str = Field(default="starter", pattern="^(starter|growth|enterprise|strategic)$")
+    status: str = Field(default="active", pattern="^(active|onboarding|at_risk|inactive|churned)$")
+    phone: str | None = Field(default=None, max_length=80)
+    health_score: int = Field(default=100, ge=0, le=100)
+    owner_department: str = Field(default="Customer Success", min_length=1, max_length=120)
+    owner_user_id: str | None = Field(default=None, max_length=120)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    notes: str = Field(default="", max_length=10000)
+
+
+class CustomerUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
+    tier: str | None = Field(default=None, pattern="^(starter|growth|enterprise|strategic)$")
+    status: str | None = Field(default=None, pattern="^(active|onboarding|at_risk|inactive|churned)$")
+    phone: str | None = Field(default=None, max_length=80)
+    health_score: int | None = Field(default=None, ge=0, le=100)
+    owner_department: str | None = Field(default=None, min_length=1, max_length=120)
+    owner_user_id: str | None = Field(default=None, max_length=120)
+    tags: list[str] | None = Field(default=None, max_length=50)
+    metadata: dict[str, Any] | None = None
+    notes: str | None = Field(default=None, max_length=10000)
+
+
+class CustomerInteractionCreate(BaseModel):
+    summary: str = Field(min_length=1, max_length=1000)
+    interaction_type: str = Field(
+        default="note",
+        pattern="^(note|email|call|meeting|ticket|health_update)$",
+    )
+    channel: str = Field(default="internal", min_length=1, max_length=80)
+    detail: dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeArticleCreate(BaseModel):

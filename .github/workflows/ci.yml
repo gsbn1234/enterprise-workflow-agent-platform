@@ -32,6 +32,30 @@ jobs:
       - name: Python compile check
         run: python -m compileall app scripts external_ticket_service
 
+      - name: Core workflow smoke
+        run: python scripts/smoke_test.py
+
+      - name: Multi-agent approval and resume smoke
+        run: python scripts/multi_agent_smoke_test.py
+
+      - name: Multi-agent parallel coordination smoke
+        run: python scripts/multi_agent_coordination_smoke_test.py
+
+      - name: Memory-augmented risk routing smoke
+        run: python scripts/memory_routing_smoke_test.py
+
+      - name: Safe self-correction smoke
+        run: python scripts/self_correction_smoke_test.py
+
+      - name: Trace replay smoke
+        run: python scripts/trace_replay_smoke_test.py
+
+      - name: RAG tool integration smoke
+        run: python scripts/rag_tool_smoke_test.py
+
+      - name: MCP-style tool service smoke
+        run: python scripts/mcp_smoke_test.py
+
       - name: Auth and RBAC smoke
         run: python scripts/auth_smoke_test.py
 
@@ -46,6 +70,15 @@ jobs:
 
       - name: Tenant isolation smoke
         run: python scripts/tenant_isolation_smoke_test.py
+
+      - name: CRM and ticket lifecycle smoke
+        run: python scripts/crm_ticket_smoke_test.py
+
+      - name: External ticket service smoke
+        run: python scripts/external_ticket_service_smoke_test.py
+
+      - name: Agent to external ticket Outbox smoke
+        run: python scripts/ticket_http_outbox_smoke_test.py
 
       - name: Audit integrity smoke
         run: python scripts/audit_integrity_smoke_test.py

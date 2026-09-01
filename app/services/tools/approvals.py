@@ -88,26 +88,30 @@ def list_approvals(status: str | None = None, limit: int = 100, tenant_id: str |
 
 def mark_approval(approval_id: str, approved: bool, decided_by: str, reason: str | None = None) -> dict | None:
     status = "approved" if approved else "denied"
+    decision_applied = False
     with get_connection() as conn:
         current = conn.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
         if not current:
             return None
-        if current["status"] != "pending":
-            return get_approval(approval_id)
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE approvals
             SET status = ?, decided_by = ?, decision_reason = ?, decided_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status = 'pending'
             """,
             (status, decided_by, reason, utc_now(), approval_id),
         )
-    record_audit(
-        "approval.decide",
-        "approval",
-        approval_id,
-        {"approved": approved, "reason": reason},
-        actor=decided_by,
-        tenant_id=row_to_dict(current).get("tenant_id"),
-    )
-    return get_approval(approval_id)
+        decision_applied = cursor.rowcount == 1
+    if decision_applied:
+        record_audit(
+            "approval.decide",
+            "approval",
+            approval_id,
+            {"approved": approved, "reason": reason},
+            actor=decided_by,
+            tenant_id=row_to_dict(current).get("tenant_id"),
+        )
+    result = get_approval(approval_id)
+    if result is not None:
+        result["decision_applied"] = decision_applied
+    return result

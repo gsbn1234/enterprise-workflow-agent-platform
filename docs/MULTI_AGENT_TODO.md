@@ -56,32 +56,42 @@
 - [x] critic-driven self-correction：critic 低分时生成修复要求并重新执行一次
 - [x] trace replay CLI：从历史 run 重放同一任务
 - [x] golden trace diff：对比当前 trace 与黄金 trace 的 Agent 序列、工具序列、checkpoint 序列、workflow 状态
+- [x] parallel fan-out/fan-in：企业 RAG / 本地政策并行检索，合规 / 业务风险并行投票
+- [x] task / handoff trace：记录任务依赖、执行状态和 Agent 间交接载荷
+- [x] human approval interrupt：审批时暂停 LangGraph，并用同一 `thread_id` 恢复
+- [x] memory-augmented routing：历史 failure pattern 会增加 Supervisor 风控约束
 
 ## 下一步优先级 P0：继续拉开差异
 
-- [ ] parallel branches：RAG Research 与 Memory Retrieve 并行
-- [ ] dynamic routing policy：Supervisor 根据历史案例、风险与工具可用性路由
-- [ ] checkpoint resume API：从指定 checkpoint fork 出新 run
+- [x] parallel branches：双 Research 与双 Risk 分支并行执行
+- [x] dynamic routing policy：Supervisor 根据历史案例、风险与审批要求路由
+- [x] approval checkpoint resume：人工审批后从原 LangGraph thread 恢复
+- [ ] checkpoint fork API：从任意历史 checkpoint 分叉出诊断 run
 - [ ] golden trace 可视化 diff 页面
 
 ## 下一步优先级 P1：评测与可观测性
 
 - [ ] LLM-as-judge adapter：对最终业务答复、风险说明、审批理由打分
-- [ ] adversarial eval：绕过审批、prompt injection、敏感信息泄露、越权工具调用
+- [x] 基础 adversarial smoke：绕过审批、prompt injection、敏感信息与越权调用
+- [ ] 扩展 adversarial 数据集与持续红队评测
 - [ ] failure taxonomy：分类记录 tool_error、planner_error、approval_miss、rag_unavailable、permission_denied
-- [ ] OpenTelemetry spans：workflow run、agent message、tool call 都作为 span
+- [x] OpenTelemetry spans：HTTP、workflow run、job 与 tool step
+- [ ] Agent message、外部 HTTP 与数据库查询的细粒度 spans
 - [ ] Langfuse / LangSmith adapter：把 trace 推送到外部可观测平台
 - [ ] 成本/延迟回归阈值：harness 失败时标记 regression
 
 ## 下一步优先级 P2：生产化
 
-- [ ] PostgreSQL + Alembic
-- [ ] Redis/Celery 或 RQ
-- [ ] 多租户 tenant isolation
-- [ ] 工具权限：role、department、tenant、data scope
+- [x] PostgreSQL 生产后端与 schema migration
+- [ ] Alembic 版本化迁移
+- [x] Redis Queue + 独立 Worker
+- [x] 多租户 tenant isolation + PostgreSQL RLS
+- [x] 核心工具权限：role、department、tenant、ticket data scope
+- [ ] 全连接器细粒度 action scope
 - [ ] 多级审批链
 - [ ] 审批超时升级
-- [ ] 真实企业系统连接器：Jira/Linear、Salesforce/HubSpot、Gmail/Outlook、Slack/Teams
+- [x] Jira、通用 HTTP 工单和 SMTP 邮件连接器
+- [ ] Linear、Salesforce/HubSpot、Gmail/Outlook、Slack/Teams 连接器
 - [ ] 官方 MCP SDK 替换手写 stdio JSON-RPC
 
 ## 简历对齐点

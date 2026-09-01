@@ -11,9 +11,9 @@ This document tracks the Agent platform's production-readiness work. It separate
 - PostgreSQL-safe job claiming with `FOR UPDATE SKIP LOCKED`.
 - Optional Redis workflow queue dispatch through `AGENT_QUEUE_BACKEND=redis`; the database remains the durable source of truth.
 - Explicit schema migration registration through `schema_migrations`.
-- Side-effect idempotency for ticket creation and email sending.
+- Side-effect idempotency for ticket creation, ticket updates, and email sending.
 - Local external-ticket-service idempotency through the `Idempotency-Key` header.
-- External side-effect outbox for ticket/email actions with pending/running/completed/failed states.
+- External side-effect outbox for ticket create/update and email actions with pending/running/completed/failed states.
 - Admin-triggered outbox retry for recovering failed ticket/email side effects.
 - Dedicated Docker outbox dispatcher worker with due-event polling, max-attempt limits, and exponential retry backoff.
 - Optional embedded outbox dispatcher through `AGENT_EMBEDDED_OUTBOX_DISPATCHER_ENABLED=true` for small single-process deployments.
@@ -25,7 +25,7 @@ This document tracks the Agent platform's production-readiness work. It separate
 - Local Docker OIDC provider for end-to-end RS256/JWKS SSO demos without an external identity-provider dependency.
 - SCIM-style user provisioning endpoints for enterprise directory lifecycle sync, including create, replace, patch, list, get, and disable-on-delete.
 - Login failure audit and temporary account lockout controls.
-- Tenant/workspace isolation foundation across users, requests, workflow runs, jobs, approvals, tickets, emails, external outbox, audit logs, multi-agent runs, trace replays, golden traces, and agent memory.
+- Tenant/workspace isolation across users, requests, workflow runs, jobs, approvals, CRM customers/interactions, tickets/timelines, emails, external outbox, audit logs, multi-agent runs, trace replays, golden traces, and agent memory.
 - OIDC tenant claim mapping through `AGENT_OIDC_TENANT_CLAIM`.
 - Optional PostgreSQL row-level security policies through `AGENT_POSTGRES_RLS_ENABLED=true` for tenant-scoped business records and trace tables.
 - Optional PostgreSQL RLS bypass role gate through `AGENT_POSTGRES_RLS_BYPASS_ROLE`; when configured, system-level bypass requires both `app.rls_bypass=on` and database role membership.
@@ -138,7 +138,9 @@ python scripts\docker_oidc_smoke_test.py --base-url http://127.0.0.1:8010 --sso-
 - GitHub Actions CI for compile checks, smoke tests, frontend build, migration/preflight, and compose config.
 - Human-in-the-loop approvals with department-scoped visibility.
 - Audit log, workflow trace, multi-agent trace, replay, golden trace diff, and evaluation reports.
-- Real integration adapters for SMTP, generic HTTP ticketing, Jira, local external-ticket-service, and RAG.
+- Real integration adapters for SMTP, generic HTTP ticketing, Jira, local external-ticket-service, RAG, and Qwen/OpenAI-compatible LLM planning.
+- CRM customer lifecycle with tenant-scoped email identity, health/status ownership, search, interaction timeline, audit, RBAC, API, and admin UI.
+- Ticket lifecycle state machine, priority-derived due dates, SLA breach state, comments/timeline, department RBAC, filtering/pagination, external dashboard authentication, and update retry.
 
 ## Required For A Real Production Launch
 

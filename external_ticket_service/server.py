@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import hmac
 import html
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status as http_status
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
 
@@ -28,14 +30,27 @@ STATUSES = {
     "resolved",
     "closed",
 }
+PRIORITIES = {"low", "normal", "high", "urgent"}
+ALLOWED_STATUS_TRANSITIONS = {
+    "open": {"investigating", "waiting_approval", "approved", "rejected", "waiting_customer", "resolved", "closed"},
+    "investigating": {"open", "waiting_approval", "approved", "rejected", "waiting_customer", "resolved", "closed"},
+    "waiting_approval": {"open", "investigating", "approved", "rejected", "closed"},
+    "approved": {"open", "investigating", "waiting_customer", "resolved", "closed"},
+    "rejected": {"open", "closed"},
+    "waiting_customer": {"open", "investigating", "resolved", "closed"},
+    "resolved": {"open", "investigating", "closed"},
+    "closed": {"open"},
+}
 
 app = FastAPI(title="Local External Ticket Service", version="2.0.0")
+basic_security = HTTPBasic(auto_error=False)
 
 
 class TicketCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=300)
     description: str = Field("", max_length=30000)
     customer_id: str | None = None
+    tenant_id: str = Field("default", min_length=1, max_length=120)
     priority: str = Field("normal", max_length=32)
     owner_department: str = Field("Customer Success", max_length=120)
     workflow_type: str | None = Field(None, max_length=120)
@@ -74,25 +89,40 @@ def startup() -> None:
     init_db()
 
 
-def require_api_token(authorization: str | None = Header(default=None)) -> None:
-    expected = os.getenv("TICKET_SERVICE_TOKEN", "").strip()
-    if not expected:
+def require_ticket_access(
+    authorization: str | None = Header(default=None),
+    credentials: HTTPBasicCredentials | None = Depends(basic_security),
+) -> None:
+    expected_token = os.getenv("TICKET_SERVICE_TOKEN", "").strip()
+    expected_username = os.getenv("TICKET_DASHBOARD_USERNAME", "").strip()
+    expected_password = os.getenv("TICKET_DASHBOARD_PASSWORD", "").strip()
+    if not expected_token and not (expected_username and expected_password):
         return
-    if authorization != f"Bearer {expected}":
-        raise HTTPException(status_code=401, detail="Invalid ticket service token.")
+    if expected_token and authorization and authorization.startswith("Bearer "):
+        if hmac.compare_digest(authorization.removeprefix("Bearer "), expected_token):
+            return
+    if expected_username and expected_password and credentials:
+        if hmac.compare_digest(credentials.username, expected_username) and hmac.compare_digest(credentials.password, expected_password):
+            return
+    raise HTTPException(
+        status_code=http_status.HTTP_401_UNAUTHORIZED,
+        detail="Valid ticket service token or dashboard credentials are required.",
+        headers={"WWW-Authenticate": 'Basic realm="External Ticket Desk"'},
+    )
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_ticket_access)])
 def dashboard(
     status: str | None = None,
     owner: str | None = None,
     priority: str | None = None,
     workflow_type: str | None = None,
+    tenant_id: str | None = None,
     q: str | None = None,
     limit: int = Query(80, ge=1, le=300),
 ) -> str:
     init_db()
-    filters = TicketFilters(status=status, owner=owner, priority=priority, workflow_type=workflow_type, q=q)
+    filters = TicketFilters(status=status, owner=owner, priority=priority, workflow_type=workflow_type, tenant_id=tenant_id, q=q)
     tickets = list_ticket_rows(limit, filters)
     rows = "\n".join(_ticket_row(ticket) for ticket in tickets)
     stats = _ticket_stats(tickets)
@@ -129,6 +159,7 @@ def dashboard(
         {_filter_input("owner", "Owner", owner or "")}
         {_filter_input("priority", "Priority", priority or "")}
         {_filter_input("workflow_type", "Workflow", workflow_type or "")}
+        {_filter_input("tenant_id", "Tenant", tenant_id or "")}
         <button class="button" type="submit">Apply</button>
         <a class="button secondary" href="/">Reset</a>
       </form>
@@ -161,7 +192,7 @@ def dashboard(
     return _page("External Ticket Desk", body)
 
 
-@app.get("/tickets/{ticket_id}", response_class=HTMLResponse)
+@app.get("/tickets/{ticket_id}", response_class=HTMLResponse, dependencies=[Depends(require_ticket_access)])
 def ticket_detail(ticket_id: str) -> str:
     init_db()
     ticket = get_ticket_row(ticket_id)
@@ -191,6 +222,7 @@ def ticket_detail(ticket_id: str) -> str:
           <dt>Category</dt><dd>{_escape(ticket["category"] or "-")}</dd>
           <dt>Risk</dt><dd>{_escape(ticket["risk_level"] or "-")}</dd>
           <dt>Owner</dt><dd>{_escape(ticket["owner_department"])}</dd>
+          <dt>Tenant</dt><dd>{_escape(ticket["tenant_id"])}</dd>
           <dt>Customer ID</dt><dd>{_escape(ticket["customer_id"] or "-")}</dd>
           <dt>Agent Run</dt><dd>{_escape(ticket["agent_run_id"] or "-")}</dd>
           <dt>Approval</dt><dd>{_escape(ticket["approval_id"] or "-")}</dd>
@@ -243,7 +275,7 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "local_external_ticket_service", "version": "2.0.0", "db_path": str(DB_PATH)}
 
 
-@app.post("/api/tickets", dependencies=[Depends(require_api_token)])
+@app.post("/api/tickets", dependencies=[Depends(require_ticket_access)])
 def create_ticket(payload: TicketCreate, idempotency_key_header: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     init_db()
     now = utc_now()
@@ -259,10 +291,11 @@ def create_ticket(payload: TicketCreate, idempotency_key_header: str | None = He
         conn.execute(
             """
             INSERT INTO tickets
-            (id, sequence, title, description, customer_id, priority, status, owner_department,
+            (id, sequence, title, description, customer_id, tenant_id, priority, status, owner_department,
              workflow_type, category, risk_level, approval_chain_json, auto_actions_json,
-             blocked_actions_json, evidence_json, agent_run_id, approval_id, idempotency_key, source, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             blocked_actions_json, evidence_json, agent_run_id, approval_id, idempotency_key, source,
+             due_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ticket_id,
@@ -270,7 +303,8 @@ def create_ticket(payload: TicketCreate, idempotency_key_header: str | None = He
                 payload.title.strip(),
                 payload.description,
                 payload.customer_id,
-                payload.priority.strip() or "normal",
+                _normalize_tenant_id(payload.tenant_id),
+                _normalize_priority(payload.priority),
                 payload.owner_department.strip() or "Customer Success",
                 payload.workflow_type,
                 payload.category,
@@ -283,6 +317,7 @@ def create_ticket(payload: TicketCreate, idempotency_key_header: str | None = He
                 payload.approval_id,
                 idempotency_key,
                 payload.source,
+                _ticket_due_at(payload.priority, now),
                 now,
                 now,
             ),
@@ -303,21 +338,22 @@ def create_ticket(payload: TicketCreate, idempotency_key_header: str | None = He
     return ticket_response(ticket, include_events=True)
 
 
-@app.get("/api/tickets")
+@app.get("/api/tickets", dependencies=[Depends(require_ticket_access)])
 def list_tickets(
     status: str | None = None,
     owner: str | None = None,
     priority: str | None = None,
     workflow_type: str | None = None,
+    tenant_id: str | None = None,
     q: str | None = None,
     limit: int = Query(100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     init_db()
-    filters = TicketFilters(status=status, owner=owner, priority=priority, workflow_type=workflow_type, q=q)
+    filters = TicketFilters(status=status, owner=owner, priority=priority, workflow_type=workflow_type, tenant_id=tenant_id, q=q)
     return [ticket_response(ticket) for ticket in list_ticket_rows(limit, filters)]
 
 
-@app.get("/api/tickets/{ticket_id}")
+@app.get("/api/tickets/{ticket_id}", dependencies=[Depends(require_ticket_access)])
 def get_ticket(ticket_id: str) -> dict[str, Any]:
     init_db()
     ticket = get_ticket_row(ticket_id)
@@ -326,7 +362,7 @@ def get_ticket(ticket_id: str) -> dict[str, Any]:
     return ticket_response(ticket, include_events=True)
 
 
-@app.patch("/api/tickets/{ticket_id}", dependencies=[Depends(require_api_token)])
+@app.patch("/api/tickets/{ticket_id}", dependencies=[Depends(require_ticket_access)])
 def update_ticket(ticket_id: str, payload: TicketUpdate) -> dict[str, Any]:
     init_db()
     ticket = get_ticket_row(ticket_id)
@@ -334,7 +370,22 @@ def update_ticket(ticket_id: str, payload: TicketUpdate) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Ticket not found.")
 
     next_status = _normalize_status(payload.status) if payload.status else None
+    _validate_status_transition(str(ticket["status"]), next_status)
+    next_priority = _normalize_priority(payload.priority) if payload.priority else None
     now = utc_now()
+    effective_status = next_status or str(ticket["status"])
+    resolved_at = ticket.get("resolved_at")
+    closed_at = ticket.get("closed_at")
+    if effective_status in {"resolved", "rejected"}:
+        resolved_at = resolved_at or now
+        closed_at = None
+    elif effective_status == "closed":
+        resolved_at = resolved_at or now
+        closed_at = closed_at or now
+    elif next_status:
+        resolved_at = None
+        closed_at = None
+    due_at = _ticket_due_at(next_priority, str(ticket["created_at"])) if next_priority else ticket.get("due_at")
     with get_connection() as conn:
         if next_status and next_status != ticket["status"]:
             insert_event(
@@ -358,14 +409,14 @@ def update_ticket(ticket_id: str, payload: TicketUpdate) -> dict[str, Any]:
                 payload={"from": ticket["owner_department"], "to": payload.owner_department},
                 created_at=now,
             )
-        if payload.priority and payload.priority != ticket["priority"]:
+        if next_priority and next_priority != ticket["priority"]:
             insert_event(
                 conn,
                 ticket_id,
                 "priority_changed",
                 payload.actor,
-                payload.comment or f"Priority changed from {ticket['priority']} to {payload.priority}.",
-                payload={"from": ticket["priority"], "to": payload.priority},
+                payload.comment or f"Priority changed from {ticket['priority']} to {next_priority}.",
+                payload={"from": ticket["priority"], "to": next_priority},
                 created_at=now,
             )
         if payload.comment and not next_status:
@@ -381,16 +432,22 @@ def update_ticket(ticket_id: str, payload: TicketUpdate) -> dict[str, Any]:
                 approval_id = COALESCE(?, approval_id),
                 agent_run_id = COALESCE(?, agent_run_id),
                 evidence_json = COALESCE(?, evidence_json),
+                due_at = ?,
+                resolved_at = ?,
+                closed_at = ?,
                 updated_at = ?
             WHERE id = ?
             """,
             (
                 next_status,
                 payload.owner_department,
-                payload.priority.strip().lower() if payload.priority else None,
+                next_priority,
                 payload.approval_id,
                 payload.agent_run_id,
                 evidence_json,
+                due_at,
+                resolved_at,
+                closed_at,
                 now,
                 ticket_id,
             ),
@@ -401,7 +458,7 @@ def update_ticket(ticket_id: str, payload: TicketUpdate) -> dict[str, Any]:
     return ticket_response(updated, include_events=True)
 
 
-@app.post("/api/tickets/{ticket_id}/comments", dependencies=[Depends(require_api_token)])
+@app.post("/api/tickets/{ticket_id}/comments", dependencies=[Depends(require_ticket_access)])
 def add_comment(ticket_id: str, payload: TicketCommentCreate) -> dict[str, Any]:
     init_db()
     if not get_ticket_row(ticket_id):
@@ -420,7 +477,7 @@ def add_comment(ticket_id: str, payload: TicketCommentCreate) -> dict[str, Any]:
     return event
 
 
-@app.post("/api/admin/clear", dependencies=[Depends(require_api_token)])
+@app.post("/api/admin/clear", dependencies=[Depends(require_ticket_access)])
 def clear_demo_data() -> dict[str, int]:
     init_db()
     with get_connection() as conn:
@@ -434,6 +491,7 @@ class TicketFilters(BaseModel):
     owner: str | None = None
     priority: str | None = None
     workflow_type: str | None = None
+    tenant_id: str | None = None
     q: str | None = None
 
 
@@ -448,6 +506,7 @@ def init_db() -> None:
                 title TEXT NOT NULL,
                 description TEXT NOT NULL,
                 customer_id TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
                 priority TEXT NOT NULL,
                 status TEXT NOT NULL,
                 owner_department TEXT NOT NULL,
@@ -462,6 +521,9 @@ def init_db() -> None:
                 approval_id TEXT,
                 idempotency_key TEXT,
                 source TEXT NOT NULL DEFAULT 'agent',
+                due_at TEXT,
+                resolved_at TEXT,
+                closed_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -484,6 +546,7 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "tickets", "workflow_type", "TEXT")
+        _ensure_column(conn, "tickets", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
         _ensure_column(conn, "tickets", "category", "TEXT")
         _ensure_column(conn, "tickets", "risk_level", "TEXT")
         _ensure_column(conn, "tickets", "approval_chain_json", "TEXT NOT NULL DEFAULT '[]'")
@@ -494,6 +557,9 @@ def init_db() -> None:
         _ensure_column(conn, "tickets", "approval_id", "TEXT")
         _ensure_column(conn, "tickets", "idempotency_key", "TEXT")
         _ensure_column(conn, "tickets", "source", "TEXT NOT NULL DEFAULT 'agent'")
+        _ensure_column(conn, "tickets", "due_at", "TEXT")
+        _ensure_column(conn, "tickets", "resolved_at", "TEXT")
+        _ensure_column(conn, "tickets", "closed_at", "TEXT")
         conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_external_tickets_idempotency_key
@@ -501,6 +567,8 @@ def init_db() -> None:
             WHERE idempotency_key IS NOT NULL
             """
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_external_tickets_tenant_status ON tickets(tenant_id, status, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_external_tickets_tenant_due ON tickets(tenant_id, due_at)")
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -538,6 +606,9 @@ def list_ticket_rows(limit: int, filters: TicketFilters | None = None) -> list[d
     if filters.workflow_type:
         where.append("lower(workflow_type) LIKE lower(?)")
         params.append(f"%{filters.workflow_type.strip()}%")
+    if filters.tenant_id:
+        where.append("tenant_id = ?")
+        params.append(_normalize_tenant_id(filters.tenant_id))
     if filters.q:
         where.append("(lower(title) LIKE lower(?) OR lower(description) LIKE lower(?) OR lower(customer_id) LIKE lower(?))")
         needle = f"%{filters.q.strip()}%"
@@ -623,6 +694,7 @@ def ticket_response(ticket: dict[str, Any], *, include_events: bool = False) -> 
         "auto_actions": _json_list(ticket.get("auto_actions_json")),
         "blocked_actions": _json_list(ticket.get("blocked_actions_json")),
         "evidence": _json_list(ticket.get("evidence_json")),
+        "sla": _sla_state(ticket),
     }
     for key in ("approval_chain_json", "auto_actions_json", "blocked_actions_json", "evidence_json"):
         response.pop(key, None)
@@ -656,8 +728,46 @@ def _json_list(value: str | None) -> list[Any]:
 def _normalize_status(status: str) -> str:
     value = status.strip().lower()
     if value not in STATUSES:
-        return value
+        raise HTTPException(status_code=400, detail=f"Unsupported status: {status}. Allowed values: {sorted(STATUSES)}")
     return value
+
+
+def _normalize_priority(priority: str) -> str:
+    value = str(priority or "").strip().lower()
+    if value not in PRIORITIES:
+        raise HTTPException(status_code=400, detail=f"Unsupported priority: {priority}. Allowed values: {sorted(PRIORITIES)}")
+    return value
+
+
+def _validate_status_transition(current_status: str, next_status: str | None) -> None:
+    if next_status is None or next_status == current_status:
+        return
+    if next_status not in ALLOWED_STATUS_TRANSITIONS.get(current_status, set()):
+        raise HTTPException(status_code=409, detail=f"Invalid status transition: {current_status} -> {next_status}.")
+
+
+def _normalize_tenant_id(value: str | None) -> str:
+    raw = str(value or "default").strip()
+    normalized = "".join(character if character.isalnum() or character in {"-", "_"} else "-" for character in raw)
+    return normalized.strip("-_") or "default"
+
+
+def _ticket_due_at(priority: str, created_at: str | None = None) -> str:
+    hours = {"urgent": 1, "high": 4, "normal": 24, "low": 72}[_normalize_priority(priority)]
+    base = _parse_datetime(created_at) if created_at else datetime.now(timezone.utc)
+    return (base + timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+def _parse_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _sla_remaining_label(due_at: str) -> str:
+    seconds = max(0, int((_parse_datetime(due_at) - datetime.now(timezone.utc)).total_seconds()))
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
+    return f"{hours}h {minutes}m"
 
 
 def _ticket_row(ticket: dict[str, Any]) -> str:
@@ -728,15 +838,17 @@ def _ticket_stats(tickets: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _sla_state(ticket: dict[str, Any]) -> dict[str, str]:
-    priority = (ticket.get("priority") or "normal").lower()
     status = (ticket.get("status") or "open").lower()
-    if status in {"approved", "resolved", "closed", "rejected"}:
-        return {"label": "done", "class": "ok"}
-    if priority in {"urgent", "high"} or ticket.get("risk_level") == "high":
-        return {"label": "4h watch", "class": "danger" if status == "open" else "warn"}
+    due_at = ticket.get("due_at")
+    if status in {"resolved", "closed", "rejected"}:
+        completed_at = ticket.get("closed_at") or ticket.get("resolved_at") or ticket.get("updated_at")
+        breached = bool(due_at and completed_at and _parse_datetime(str(completed_at)) > _parse_datetime(str(due_at)))
+        return {"label": "breached" if breached else "met", "class": "danger" if breached else "ok"}
+    if due_at and datetime.now(timezone.utc) > _parse_datetime(str(due_at)):
+        return {"label": "breached", "class": "danger"}
     if status == "waiting_approval":
         return {"label": "approval", "class": "warn"}
-    return {"label": "normal", "class": "ok"}
+    return {"label": _sla_remaining_label(str(due_at)) if due_at else "not set", "class": "warn" if status == "waiting_customer" else "ok"}
 
 
 def _evidence_html(items: list[Any]) -> str:

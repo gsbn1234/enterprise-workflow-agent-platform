@@ -169,7 +169,16 @@ def execute_ticket_update(
     comment = command.comment
     if not comment:
         comment = f"Natural-language update by {actor}: {compact_text(command.q or ticket['title'], 160)}"
-    updated = update_ticket(ticket["id"], actor=actor, comment=comment, **field_changes)
+    try:
+        updated = update_ticket(ticket["id"], actor=actor, comment=comment, tenant_id=tenant_id, **field_changes)
+    except ValueError as exc:
+        return {
+            "intent": "update",
+            "ok": False,
+            "error_code": "invalid_ticket_update",
+            "message": str(exc),
+            "ticket": ticket,
+        }
     if not updated:
         return {
             "intent": "update",

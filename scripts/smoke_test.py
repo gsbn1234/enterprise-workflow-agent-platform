@@ -7,11 +7,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ["AGENT_DB_PATH"] = str(ROOT / "data" / "smoke_test.sqlite3")
+os.environ["KNOWLEDGE_RAG_BASE_URL"] = ""
+os.environ["AGENT_TOOL_MODE"] = "mock"
+os.environ["AGENT_TICKET_PROVIDER"] = "mock"
+os.environ["AGENT_EMAIL_PROVIDER"] = "mock"
 sys.path.insert(0, str(ROOT))
 
 from app.db import reset_database  # noqa: E402
 from app.services.agent import decide_approval_and_resume, run_workflow  # noqa: E402
 from app.services.tools.approvals import list_approvals  # noqa: E402
+from app.services.tools.email import list_emails  # noqa: E402
+from app.services.tools.ticketing import list_tickets  # noqa: E402
 
 
 def main() -> None:
@@ -31,6 +37,14 @@ def main() -> None:
     resumed = decide_approval_and_resume(pending[0]["id"], True, "manager", "smoke approve")
     assert resumed and resumed["status"] == "completed", resumed
     assert any(step["tool_name"] == "send_email" for step in resumed["steps"]), resumed
+    side_effect_counts = (len(list_tickets(limit=100)), len(list_emails(limit=100)))
+    repeated = decide_approval_and_resume(pending[0]["id"], True, "manager", "repeat same decision")
+    conflicting = decide_approval_and_resume(pending[0]["id"], False, "manager", "late conflicting decision")
+    assert repeated and repeated["status"] == "completed", repeated
+    assert conflicting and conflicting["status"] == "completed", conflicting
+    assert (len(list_tickets(limit=100)), len(list_emails(limit=100))) == side_effect_counts
+    decided = list_approvals(status="approved")
+    assert len(decided) == 1 and decided[0]["id"] == pending[0]["id"], decided
 
     low_risk = run_workflow("请帮业务运营团队登记一次普通流程优化建议：把每周报表归档动作加入待办")
     assert low_risk["status"] == "completed", low_risk

@@ -86,7 +86,15 @@ def query_enterprise_rag(
         "user_role": user_role,
     }
     try:
-        response = httpx.post(f"{settings.rag_base_url}/api/chat/ask", json=payload, timeout=8.0)
+        headers = {}
+        if settings.rag_service_token:
+            headers["X-RAG-Service-Token"] = settings.rag_service_token
+        response = httpx.post(
+            f"{settings.rag_base_url}/api/chat/ask",
+            json=payload,
+            headers=headers,
+            timeout=settings.rag_timeout_seconds,
+        )
         response.raise_for_status()
         rag_payload = response.json()
     except Exception as exc:
