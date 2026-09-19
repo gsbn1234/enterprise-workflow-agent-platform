@@ -138,6 +138,7 @@ def verify_audit_log_integrity(limit: int | None = None) -> dict:
     legacy = 0
     tampered: list[dict[str, Any]] = []
     broken_links: list[dict[str, Any]] = []
+    unhashed: list[dict[str, Any]] = []
     orphaned_prefix = False
     previous_hash: str | None = None
     seen_hashed = False
@@ -145,7 +146,16 @@ def verify_audit_log_integrity(limit: int | None = None) -> dict:
     for row in rows:
         expected_hash = row.get("row_hash")
         if not expected_hash:
-            legacy += 1
+            # A row without a hash is only benign *before* the hash chain starts:
+            # those were written by versions that predate row hashing. A gap
+            # *after* a hashed row means the chain was interrupted -- by a bug or
+            # by someone clearing hashes to hide an edit. Treating every gap as
+            # "legacy" is what made `UPDATE audit_logs SET row_hash = NULL`
+            # a complete bypass of this verifier.
+            if seen_hashed:
+                unhashed.append({"id": row.get("id"), "reason": "missing_row_hash_after_hashed_row"})
+            else:
+                legacy += 1
             continue
         checked += 1
         actual_hash = audit_row_hash(row)
@@ -167,16 +177,25 @@ def verify_audit_log_integrity(limit: int | None = None) -> dict:
         seen_hashed = True
 
     return {
-        "valid": not tampered and not broken_links,
+        # `checked > 0` matters: an empty log, a log whose rows were all deleted,
+        # or one whose hashes were all cleared has nothing to verify, and
+        # "nothing to verify" must not read as "verified". Same for `unhashed`:
+        # a hole in the chain is not a pass.
+        "valid": not tampered and not broken_links and not unhashed and checked > 0,
         "checked_count": checked,
         "legacy_count": legacy,
+        "unhashed_count": len(unhashed),
         "total_count": len(rows),
         "tampered_count": len(tampered),
         "broken_link_count": len(broken_links),
         "orphaned_prefix": orphaned_prefix,
+        # True when verification succeeded but part of the log predates hashing.
+        # Callers that need "the whole log is provably intact" must check this.
+        "degraded": legacy > 0,
         "latest_hash": previous_hash,
         "tampered": tampered[:20],
         "broken_links": broken_links[:20],
+        "unhashed": unhashed[:20],
     }
 
 

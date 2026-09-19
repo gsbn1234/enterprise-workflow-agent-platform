@@ -144,6 +144,24 @@ class Settings:
         llm_enabled,
     )
     llm_planner_min_confidence: float = float(os.getenv("AGENT_LLM_PLANNER_MIN_CONFIDENCE", "0.55"))
+    # Phase 5-1. Retries are capped at one on purpose: the only failures worth a
+    # second round trip are transport ones, and a second attempt at a structured
+    # output that already came back malformed tends to reproduce the same answer.
+    llm_max_retries: int = int(os.getenv("AGENT_LLM_MAX_RETRIES", "1"))
+    llm_retry_backoff_seconds: float = float(os.getenv("AGENT_LLM_RETRY_BACKOFF_SECONDS", "0.5"))
+    # Ask the provider to constrain its answer to a JSON object rather than
+    # merely requesting one in the prompt. Switchable off for gateways that
+    # reject ``response_format``.
+    llm_json_mode: bool = _bool_env("AGENT_LLM_JSON_MODE", True)
+    # The triage fallback is a *fallback*, so it inherits the master switch and
+    # stays off whenever the LLM is off. It fires only below the confidence bar.
+    llm_triage_fallback_enabled: bool = _bool_env("AGENT_LLM_TRIAGE_FALLBACK_ENABLED", llm_enabled)
+    llm_triage_min_confidence: float = float(os.getenv("AGENT_LLM_TRIAGE_MIN_CONFIDENCE", "0.55"))
+    llm_runbook_candidates_enabled: bool = _bool_env("AGENT_LLM_RUNBOOK_CANDIDATES_ENABLED", llm_enabled)
+    # Per-call telemetry rows. On by default because the whole point of the
+    # table is to make "what did the LLM cost us" answerable; it can be switched
+    # off where the extra write is not wanted.
+    llm_telemetry_enabled: bool = _bool_env("AGENT_LLM_TELEMETRY_ENABLED", True)
 
     tool_mode: str = os.getenv("AGENT_TOOL_MODE", "mock").strip().lower()
 
@@ -182,6 +200,13 @@ if settings.queue_backend not in {"db", "redis"}:
     raise ValueError("AGENT_QUEUE_BACKEND must be 'db' or 'redis'.")
 if settings.llm_provider not in {"qwen", "vllm", "openai_compatible", "openai-compatible"}:
     raise ValueError("AGENT_LLM_PROVIDER must be 'qwen', 'vllm', or 'openai_compatible'.")
+if settings.llm_max_retries not in {0, 1}:
+    raise ValueError(
+        "AGENT_LLM_MAX_RETRIES must be 0 or 1. Only transport failures are retried, so a longer "
+        "ladder would multiply cost and latency without changing the outcome."
+    )
+if not 0.0 <= settings.llm_triage_min_confidence <= 1.0:
+    raise ValueError("AGENT_LLM_TRIAGE_MIN_CONFIDENCE must be between 0 and 1.")
 if not settings.db_path.is_absolute():
     settings.db_path = BASE_DIR / settings.db_path
 settings.db_path.parent.mkdir(parents=True, exist_ok=True)

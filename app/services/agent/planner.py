@@ -6,7 +6,8 @@ import re
 from app.config import settings
 from app.services.agent.state import PlanDecision
 from app.services.agent.ticket_commands import parse_ticket_command
-from app.services.llm import LLMError, complete_json, llm_ready
+from app.services.llm import LlmOutcome, call_json, llm_ready
+from app.services.llm_telemetry import record_llm_call
 
 
 EMAIL_RE = re.compile(r"[\w.\-+]+@[\w.\-]+\.\w+")
@@ -76,7 +77,7 @@ def plan_workflow(objective: str) -> PlanDecision:
             final_ticket_status=ticket_command.status or "unchanged",
             approval_action="none",
         )
-    llm_plan = _llm_plan(objective)
+    llm_plan, llm_outcome = _llm_plan(objective)
     if llm_plan:
         return llm_plan
     category = _classify_category(objective)
@@ -108,7 +109,10 @@ def plan_workflow(objective: str) -> PlanDecision:
         amount=amount,
         recipient_email=recipient,
         recommended_owner=owner,
-        reason=_reason(category, amount, risk_level, needs_approval, policy["workflow_type"], policy["approval_chain"]),
+        reason=_reason(
+            category, amount, risk_level, needs_approval, policy["workflow_type"],
+            policy["approval_chain"], llm_note=_llm_failure_note(llm_outcome),
+        ),
         proposed_tools=proposed_tools,
         workflow_type=policy["workflow_type"],
         approval_chain=policy["approval_chain"],
@@ -119,43 +123,127 @@ def plan_workflow(objective: str) -> PlanDecision:
     )
 
 
-def _llm_plan(objective: str) -> PlanDecision | None:
+def _llm_failure_note(outcome: LlmOutcome) -> str:
+    """One clause saying the planner's model was asked and did not answer.
+
+    Before Phase 5-1 a failed planner call left no trace in the plan at all:
+    ``except LLMError: return None`` meant "the LLM is switched off" and "the
+    LLM is timing out" produced byte-identical plans, and the operator reading
+    one had no way to tell a configuration choice from an incident.
+
+    Only the failure case adds text. The ``disabled`` case is the platform's
+    default configuration and is already visible in ``llm_status()``; writing a
+    note into every deterministic plan would change the reason string of every
+    run that never wanted a model in the first place.
+    """
+    if not outcome.failed:
+        return ""
+    detail = f" ({outcome.error_type})" if outcome.error_type else ""
+    return f"LLM planner attempted but returned {outcome.status}{detail}，已改用确定性分类。"
+
+
+def _llm_plan(objective: str) -> tuple[PlanDecision | None, LlmOutcome]:
+    """Ask the model to classify the request. Returns ``(plan, outcome)`` always.
+
+    **Every** path returns the two-tuple, including the success path — the
+    caller unpacks unconditionally, so a bare ``PlanDecision`` here would take
+    the whole run down the moment a provider answered well enough to be
+    trusted. That is precisely the failure this function's docstring exists to
+    prevent, because it is invisible to every test that only makes the model
+    fail: an unavailable provider exercises the ``return None, outcome`` lines
+    and never reaches the end of this function.
+
+    The outcome is returned even on success so ``plan_workflow`` can report
+    what happened, and is returned on every failure path so the deterministic
+    plan that follows can say *why* it is deterministic.
+
+    Everything the model proposes is re-derived through the same safety
+    functions the deterministic path uses: ``risk_level``, ``needs_approval``
+    and the whole workflow policy are computed from the (validated) category,
+    amount and recipient and never read from the answer.
+    """
     if not settings.llm_planner_enabled or not llm_ready():
-        return None
-    try:
-        suggestion = complete_json(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You classify user requests for a safe enterprise AI agent. "
-                        "Return JSON only. Do not execute tools or approve actions. "
-                        "Allowed categories: refund, complaint, communication, security, "
-                        "access_request, remote_work, procurement, incident, general. "
-                        "Allowed priorities: low, normal, high, critical. "
-                        "Use null when amount or recipient_email is absent."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Request: {objective}\n\n"
-                        "Return JSON with keys: category, priority, amount, recipient_email, "
-                        "recommended_owner, confidence, explanation."
-                    ),
-                },
-            ],
-            temperature=0,
-            max_tokens=450,
+        return None, LlmOutcome(
+            status="disabled",
+            operation="planner_classification",
+            provider=settings.llm_provider,
+            model=settings.llm_model,
         )
-    except LLMError as exc:
-        logger.warning("llm.planner_failed", extra={"event": "llm.planner_failed", "error": str(exc)})
-        return None
+    outcome = call_json(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You classify user requests for a safe enterprise AI agent. "
+                    "Return JSON only. Do not execute tools or approve actions. "
+                    "Allowed categories: refund, complaint, communication, security, "
+                    "access_request, remote_work, procurement, incident, general. "
+                    "Allowed priorities: low, normal, high, critical. "
+                    "Use null when amount or recipient_email is absent."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Request: {objective}\n\n"
+                    "Return JSON with keys: category, priority, amount, recipient_email, "
+                    "recommended_owner, confidence, explanation."
+                ),
+            },
+        ],
+        operation="planner_classification",
+        temperature=0,
+        max_tokens=450,
+    )
+    if outcome.failed:
+        record_llm_call(outcome)
+        logger.warning(
+            "llm.planner_failed",
+            extra={
+                "event": "llm.planner_failed",
+                "status": outcome.status,
+                "error_type": outcome.error_type,
+                "error": outcome.error_message,
+                "latency_ms": outcome.latency_ms,
+                "retry_count": outcome.retry_count,
+            },
+        )
+        return None, outcome
+    suggestion = outcome.value or {}
 
     confidence = _safe_float(suggestion.get("confidence"), 0.0)
     if confidence < settings.llm_planner_min_confidence:
-        return None
+        # A low-confidence answer is a refusal, not an error: the model was
+        # asked, it answered, and it said it was not sure. Calling that a
+        # failure would put an ``invalid_output`` on a call that worked.
+        #
+        # It is still a call whose answer was discarded, though, and that is
+        # worth a row. ``fallback_used`` is what records it, and the row is
+        # written from *this* outcome rather than the raw one so the table and
+        # the plan tell the same story.
+        withheld = LlmOutcome(
+            status="success",
+            operation=outcome.operation,
+            provider=outcome.provider,
+            model=outcome.model,
+            value=suggestion,
+            latency_ms=outcome.latency_ms,
+            prompt_tokens=outcome.prompt_tokens,
+            completion_tokens=outcome.completion_tokens,
+            total_tokens=outcome.total_tokens,
+            usage_available=outcome.usage_available,
+            retry_count=outcome.retry_count,
+            fallback_used=True,
+            error_type="retained_deterministic_plan",
+            error_message=(
+                f"planner confidence {confidence:.2f} is below the "
+                f"{settings.llm_planner_min_confidence:.2f} bar; deterministic plan used"
+            ),
+        )
+        record_llm_call(withheld)
+        return None, withheld
 
+    record_llm_call(outcome)
     category = str(suggestion.get("category") or "").strip().lower()
     if category not in ALLOWED_CATEGORIES:
         category = _classify_category(objective)
@@ -182,22 +270,25 @@ def _llm_plan(objective: str) -> PlanDecision | None:
         f"suggested {category}. {explanation} Safety policy: {deterministic_reason}"
     )
 
-    return PlanDecision(
-        category=category,
-        priority=priority,
-        risk_level=risk_level,
-        needs_approval=needs_approval,
-        amount=amount,
-        recipient_email=recipient,
-        recommended_owner=owner,
-        reason=reason,
-        proposed_tools=proposed_tools,
-        workflow_type=policy["workflow_type"],
-        approval_chain=policy["approval_chain"],
-        blocked_actions=policy["blocked_actions"],
-        auto_actions=policy["auto_actions"],
-        final_ticket_status=policy["final_ticket_status"],
-        approval_action=policy["approval_action"],
+    return (
+        PlanDecision(
+            category=category,
+            priority=priority,
+            risk_level=risk_level,
+            needs_approval=needs_approval,
+            amount=amount,
+            recipient_email=recipient,
+            recommended_owner=owner,
+            reason=reason,
+            proposed_tools=proposed_tools,
+            workflow_type=policy["workflow_type"],
+            approval_chain=policy["approval_chain"],
+            blocked_actions=policy["blocked_actions"],
+            auto_actions=policy["auto_actions"],
+            final_ticket_status=policy["final_ticket_status"],
+            approval_action=policy["approval_action"],
+        ),
+        outcome,
     )
 
 
@@ -407,7 +498,19 @@ def _workflow_policy(category: str, amount: float | None, recipient: str | None,
     }
 
 
-def _reason(category: str, amount: float | None, risk_level: str, needs_approval: bool, workflow_type: str, approval_chain: list[str]) -> str:
+def _reason(
+    category: str,
+    amount: float | None,
+    risk_level: str,
+    needs_approval: bool,
+    workflow_type: str,
+    approval_chain: list[str],
+    *,
+    llm_note: str = "",
+) -> str:
     amount_text = f"，识别金额 {amount:g}" if amount is not None else ""
     approval_text = f"需要 {' -> '.join(approval_chain)} 审批" if needs_approval and approval_chain else "可自动执行低风险动作"
-    return f"分类为 {category}，流程为 {workflow_type}{amount_text}，风险等级 {risk_level}，{approval_text}。"
+    return (
+        f"分类为 {category}，流程为 {workflow_type}{amount_text}，"
+        f"风险等级 {risk_level}，{approval_text}。{llm_note}"
+    )

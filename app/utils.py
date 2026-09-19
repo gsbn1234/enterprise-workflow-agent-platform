@@ -40,8 +40,27 @@ def compact_text(text: str, limit: int = 300) -> str:
     return normalized[: limit - 3] + "..."
 
 
+# USD per token, applied to whatever count is being priced. Kept in one place
+# so the estimated figure and the provider-reported figure stay comparable:
+# Phase 5-1 changed where the *count* comes from, not what a token costs.
+COST_PER_TOKEN = 0.000002
+
+
 def estimate_token_cost(text: str) -> float:
     # A deterministic local estimate for portfolio demos. Replace with provider usage
     # when a real LLM gateway is wired in.
     approx_tokens = max(1, len(text) // 4)
-    return round(approx_tokens * 0.000002, 6)
+    return round(approx_tokens * COST_PER_TOKEN, 6)
+
+
+def token_cost(total_tokens: int | None) -> float | None:
+    """Price a token count the provider actually reported.
+
+    Returns ``None`` rather than ``0.0`` when the count is missing, so a caller
+    that wants to fall back can tell "the provider said zero tokens" from "the
+    provider said nothing" — the same distinction ``llm_calls.usage_available``
+    exists to preserve.
+    """
+    if total_tokens is None:
+        return None
+    return round(max(0, int(total_tokens)) * COST_PER_TOKEN, 6)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import sys
 from pathlib import Path
@@ -27,15 +28,51 @@ def auth_header(token: str) -> dict[str, str]:
 
 
 def tamper_audit_row(audit_id: str) -> None:
-    with get_connection() as conn:
-        conn.execute(
-            """
-            UPDATE audit_logs
-            SET detail_json = '{"tampered":true}'
-            WHERE id = ?
-            """,
-            (audit_id,),
-        )
+    run_sql(
+        """
+        UPDATE audit_logs
+        SET detail_json = '{"tampered":true}'
+        WHERE id = ?
+        """,
+        (audit_id,),
+    )
+
+
+def run_sql(sql: str, params: tuple = ()) -> None:
+    """Run one statement on a connection that is closed before we return.
+
+    `with get_connection() as conn:` commits but never closes -- `__exit__` on a
+    raw sqlite3 connection only ends the transaction. Two things then keep the
+    file locked on Windows, and both break `reset_database`'s `unlink()`:
+
+    * connections left in a reference cycle (every `with get_connection()` in
+      `init_db` leaves one) are only reclaimed by the cycle collector, so a
+      `gc.collect()` has to run before the next reset;
+    * a `with ... as conn:` written directly in `main()` binds `conn` for the
+      rest of the function, so the collector cannot reclaim it at all -- that
+      one has to be closed explicitly, which is what this helper is for.
+    """
+    conn = get_connection()
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fresh_database() -> None:
+    """`reset_database`, after clearing the connections that would block it."""
+    gc.collect()
+    reset_database(seed=True)
+
+
+def hashed_rows() -> dict[str, dict]:
+    """Three freshly chained rows on a clean database."""
+    fresh_database()
+    return {
+        name: record_audit(f"audit.chain.{name}", "smoke", name, {}, actor="smoke")
+        for name in ("a", "b", "c")
+    }
 
 
 def main() -> None:
@@ -53,6 +90,63 @@ def main() -> None:
     assert initial["tampered_count"] == 0, initial
     assert initial["broken_link_count"] == 0, initial
 
+    # --- regression: clearing hashes must not read as "verified" ---
+    # Before this, `UPDATE audit_logs SET row_hash = NULL` made every row look
+    # like a pre-hashing legacy row, so the verifier returned valid=True with
+    # checked_count=0: deleting the evidence was a complete bypass.
+    # Runs before the TestClient block on purpose: on Windows the app keeps the
+    # SQLite file open, and this section needs to reset the database.
+    hashed_rows()
+    assert verify_audit_log_integrity()["valid"] is True
+
+    # (a) every hash cleared -> nothing left to verify, which is not a pass
+    run_sql("UPDATE audit_logs SET row_hash = NULL")
+    cleared = verify_audit_log_integrity()
+    assert cleared["valid"] is False, cleared
+    assert cleared["checked_count"] == 0, cleared
+
+    # (b) a gap *after* the chain started is reported, not skipped as legacy
+    rows = hashed_rows()
+    run_sql("UPDATE audit_logs SET row_hash = NULL WHERE id = ?", (rows["c"]["id"],))
+    gap = verify_audit_log_integrity()
+    assert gap["valid"] is False, gap
+    assert gap["unhashed_count"] == 1, gap
+    # Relative to the seeded rows, which are hashed too: exactly the one row we
+    # cleared is missing from the chain, and nothing is excused as legacy.
+    assert gap["checked_count"] == gap["total_count"] - 1, gap
+    assert gap["legacy_count"] == 0, gap
+
+    # (c) a hash that is present but wrong is still caught
+    rows = hashed_rows()
+    run_sql("UPDATE audit_logs SET row_hash = 'deadbeef' WHERE id = ?", (rows["b"]["id"],))
+    forged = verify_audit_log_integrity()
+    assert forged["valid"] is False, forged
+    assert any(item["id"] == rows["b"]["id"] for item in forged["tampered"]), forged
+
+    # (d) rows written before hashing existed stay benign (backward compatible)
+    hashed_rows()
+    run_sql("DELETE FROM audit_logs")
+    run_sql(
+        """
+        INSERT INTO audit_logs
+        (id, actor, event_type, target_type, target_id, tenant_id, detail_json,
+         previous_hash, row_hash, created_at)
+        VALUES ('audit-legacy-1', 'legacy', 'legacy.event', 'smoke', 'legacy', 'default',
+                '{}', NULL, NULL, '2020-01-01T00:00:00.000000+00:00')
+        """
+    )
+    record_audit("audit.chain.after_legacy", "smoke", "after_legacy", {}, actor="smoke")
+    with_legacy = verify_audit_log_integrity()
+    assert with_legacy["valid"] is True, with_legacy
+    assert with_legacy["legacy_count"] == 1, with_legacy
+    assert with_legacy["degraded"] is True, with_legacy
+
+    # --- API surface still behaves ---
+    fresh_database()
+    ensure_demo_users()
+    first = record_audit("audit.integrity.first", "smoke", "first", {"step": 1}, actor="smoke")
+    record_audit("audit.integrity.second", "smoke", "second", {"step": 2}, actor="smoke")
+
     with TestClient(app) as client:
         login = client.post("/api/auth/login", json={"user_id": "admin", "password": "AdminPass123"})
         assert login.status_code == 200, login.text
@@ -61,6 +155,7 @@ def main() -> None:
         api_initial = client.get("/api/admin/audit/integrity", headers=auth_header(token))
         assert api_initial.status_code == 200, api_initial.text
         assert api_initial.json()["valid"] is True, api_initial.json()
+        assert api_initial.json()["degraded"] is False, api_initial.json()
 
         tamper_audit_row(first["id"])
         api_tampered = client.get("/api/admin/audit/integrity", headers=auth_header(token))

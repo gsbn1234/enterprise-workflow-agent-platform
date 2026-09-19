@@ -72,6 +72,7 @@ TENANT_RLS_TABLES = (
     "departments",
     "employees",
     "assets",
+    "llm_calls",
 )
 
 RELATED_RLS_TABLES = (
@@ -604,6 +605,13 @@ def init_db(seed: bool | None = None) -> None:
                 completed_at TEXT
             );
 
+            -- ``visibility`` is inert. Nothing in this codebase filters on it:
+            -- ``get_article``, ``list_articles`` and ``search_knowledge`` are
+            -- all unconditional, so an article marked ``restricted`` is
+            -- returned to every caller exactly like an ``internal`` one. The
+            -- column is kept because removing it is a migration this version
+            -- does not need, and every writer sets it to 'internal'. It is not
+            -- an access-control field; see ``tools/knowledge.py:create_article``.
             CREATE TABLE IF NOT EXISTS knowledge_articles (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -661,6 +669,38 @@ def init_db(seed: bool | None = None) -> None:
                 status TEXT NOT NULL,
                 resolved_at TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            -- One row per LLM call that was actually attempted. Its own table
+            -- rather than columns on ``workflow_runs`` or ``multi_agent_runs``
+            -- because a single run makes several calls with different outcomes,
+            -- and an average hides exactly the thing worth seeing: which call
+            -- failed, how, and how long the retry ladder took.
+            --
+            -- ``usage_available`` is stored rather than inferred from a NULL
+            -- token count, so "the provider told us nothing" stays tellable
+            -- apart from "the provider told us zero".
+            CREATE TABLE IF NOT EXISTS llm_calls (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                operation TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                error_type TEXT,
+                error_message TEXT,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                fallback_used INTEGER NOT NULL DEFAULT 0,
+                usage_available INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                total_tokens INTEGER,
+                schema_name TEXT,
+                multi_agent_run_id TEXT,
+                workflow_run_id TEXT,
+                ticket_id TEXT
             );
             """
         )
@@ -993,6 +1033,14 @@ def _ensure_indexes(conn: sqlite3.Connection | PostgresConnection) -> None:
             ON audit_logs(tenant_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_audit_logs_event_target
             ON audit_logs(event_type, target_type, target_id);
+        CREATE INDEX IF NOT EXISTS idx_llm_calls_created
+            ON llm_calls(created_at);
+        CREATE INDEX IF NOT EXISTS idx_llm_calls_tenant_created
+            ON llm_calls(tenant_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_llm_calls_operation_status
+            ON llm_calls(operation, status);
+        CREATE INDEX IF NOT EXISTS idx_llm_calls_multi_agent_run
+            ON llm_calls(multi_agent_run_id);
         CREATE INDEX IF NOT EXISTS idx_audit_logs_row_hash
             ON audit_logs(row_hash);
         CREATE INDEX IF NOT EXISTS idx_employees_tenant_dept

@@ -8,7 +8,14 @@ from app.services.agent.executor import get_run_detail, run_workflow
 from app.services.agent.planner import plan_workflow
 from app.services.it.risk_gate import ACTION_CLASSES
 from app.services.it.triage import CRITICAL_SERVICES
-from app.services.llm import LLMError, complete_json, llm_ready
+from app.services.llm import LlmOutcome, call_json, llm_ready
+from app.services.llm_schemas import (
+    CriticReviewResult,
+    EvidenceSynthesisResult,
+    RiskVoteSuggestion,
+    RunbookCandidate,
+)
+from app.services.llm_telemetry import record_llm_call
 from app.services.multi_agent.memory import add_memory, search_similar_memories
 from app.services.tools.knowledge import query_enterprise_rag, search_knowledge
 from app.services.tools.registry import call_tool
@@ -230,7 +237,7 @@ class RagResearchAgent:
             warnings.append("enterprise_rag_unavailable")
         if not evidence:
             warnings.append("no_relevant_policy_evidence")
-        llm_synthesis = _expert_json(
+        synthesis = _expert_call(
             "evidence_synthesis",
             (
                 "You are an enterprise evidence synthesis agent. Compare the supplied evidence channels, "
@@ -243,7 +250,10 @@ class RagResearchAgent:
                 "enterprise_can_answer": bool(rag.get("can_answer")),
                 "evidence": evidence[:6],
             },
+            operation="evidence_synthesis",
+            schema=EvidenceSynthesisResult,
         )
+        llm_synthesis = synthesis.value if synthesis.ok else None
         return {
             "enterprise_rag": rag,
             "local_policy": local,
@@ -255,7 +265,10 @@ class RagResearchAgent:
             "warnings": warnings,
             "synthesis_summary": str((llm_synthesis or {}).get("summary") or "").strip(),
             "conflicts": _string_list((llm_synthesis or {}).get("conflicts"), limit=5),
-            "reasoning_mode": "llm_augmented" if llm_synthesis else "deterministic_evidence_merge",
+            "reasoning_mode": _reasoning_mode(
+                synthesis, deterministic="deterministic_evidence_merge", augmented="llm_augmented"
+            ),
+            "llm": _llm_trace(synthesis),
             "producer": self.name,
             "handoff_contract": {
                 "consumer": "tool_execution",
@@ -363,10 +376,24 @@ class ResolutionAgent:
             # illustrating the answer rather than standing in for one.
             **_historical_block(historical, referenced=False, chosen_action=action_type),
         }
-        polished = self._polish_diagnosis(objective, resolution)
+        polish_outcome, polished = self._polish_diagnosis(objective, resolution)
         if polished:
             resolution["diagnosis"] = polished
             resolution["mode"] = "llm_augmented"
+        elif polish_outcome.failed:
+            # Wording was requested and did not arrive. The deterministic
+            # diagnosis above is already complete, so this changes nothing a
+            # reader acts on — but ``mode`` should not claim a rewrite that
+            # never happened, and the audit trail should say why the phrasing
+            # is the plain one.
+            resolution["mode"] = "deterministic_llm_failed"
+        candidates = self._runbook_candidates(objective, resolution)
+        resolution["runbook_candidates"] = candidates["steps"]
+        resolution["runbook_mode"] = candidates["mode"]
+        resolution["llm"] = {
+            "diagnosis_polish": _llm_trace(polish_outcome),
+            "runbook_candidates": _llm_trace(candidates["outcome"]),
+        }
         return resolution
 
     def _no_knowledge(
@@ -405,13 +432,29 @@ class ResolutionAgent:
             "reason": "no_knowledge_evidence",
             "mode": "deterministic_no_knowledge",
             "warnings": list(research_output.get("warnings") or []),
+            # Present and empty, for the same reason the two shapes exist at
+            # all: a consumer should be able to read the key without first
+            # asking which exit produced the resolution. Empty is also the
+            # correct answer here — nothing was asked, because nothing was
+            # retrieved to ground an answer in.
+            "runbook_candidates": [],
+            "runbook_mode": "skipped_no_knowledge",
+            "llm": {
+                "diagnosis_polish": _llm_trace(_disabled_outcome()),
+                "runbook_candidates": _llm_trace(_disabled_outcome()),
+            },
             "producer": self.name,
             **_historical_block(historical, referenced=bool(historical), chosen_action=None),
         }
 
-    def _polish_diagnosis(self, objective: str, resolution: dict) -> str | None:
-        """Optional rewording of the diagnosis. Cannot change what will run."""
-        payload = _expert_json(
+    def _polish_diagnosis(self, objective: str, resolution: dict) -> tuple[LlmOutcome, str | None]:
+        """Optional rewording of the diagnosis. Cannot change what will run.
+
+        Returns the outcome alongside the text so the caller can say whether the
+        plain diagnosis is plain because no model was asked or because the one
+        that was asked did not answer.
+        """
+        outcome = _expert_call(
             self.name,
             (
                 "You are an enterprise IT resolution agent. Rewrite the supplied diagnosis in one or two "
@@ -425,9 +468,101 @@ class ResolutionAgent:
                 "action_type": resolution["action_type"],
                 "evidence": resolution["evidence"],
             },
+            operation="resolution_diagnosis_polish",
         )
-        text = str((payload or {}).get("diagnosis") or "").strip()
-        return text or None
+        text = str((outcome.value or {}).get("diagnosis") or "").strip() if outcome.ok else ""
+        return outcome, (text or None)
+
+    def _runbook_candidates(self, objective: str, resolution: dict) -> dict:
+        """Scenario 2: proposed steps, which change nothing that will run.
+
+        This platform's order is evidence → deterministic action mapping → risk
+        gate → approval → tool. A suggestion has to survive every one of those
+        before it can cause anything, and the one thing it may never do is
+        replace the action this run already selected: ``resolution["action_type"]``
+        — the only field the gate reads — is not touched here or anywhere
+        downstream, and the steps below are attached with ``advisory_only``
+        set so a reader cannot mistake them for a plan of record.
+
+        Two gates are applied here, in code, before a step is even reported.
+        ``ACTION_CLASSES`` membership is the deterministic action mapping: a
+        name the platform does not know is dropped rather than passed along for
+        someone else to interpret. And nothing is asked at all when this
+        resolution is ``NO_KNOWLEDGE`` — that path means retrieval found no
+        policy to stand on, and a model asked to fill that silence would be
+        inventing the knowledge the platform just said it did not have.
+
+        The case where these do carry information is the fallback: when
+        ``_select_action`` found nothing to go on it returns read-only
+        diagnostics, and the candidates are then the only account of what a fix
+        might involve. Even there they are reported, not adopted.
+        """
+        empty = {"steps": [], "mode": "not_attempted", "outcome": _disabled_outcome()}
+        if not settings.llm_runbook_candidates_enabled:
+            return empty
+        if resolution.get("status") != "PROPOSED":
+            return empty
+        evidence = list(resolution.get("evidence") or [])
+        if not evidence:
+            return empty
+        outcome = _expert_call(
+            self.name,
+            (
+                "You are an enterprise IT resolution agent. Propose candidate runbook steps that are "
+                "supported by the supplied evidence only. Return JSON with a `steps` array, where each "
+                "step has description, action_type, requires_approval and citation. Use only action_type "
+                "values from the supplied list. Never propose a step the evidence does not support, and "
+                "never propose a step that deletes data. Return an empty steps array if the evidence does "
+                "not support any."
+            ),
+            {
+                "objective": objective,
+                "diagnosis": resolution.get("diagnosis"),
+                "selected_action_type": resolution.get("action_type"),
+                "selected_action_reason": resolution.get("reason"),
+                "allowed_action_types": sorted(ACTION_CLASSES),
+                "evidence": evidence[:3],
+            },
+            operation="resolution_runbook_candidates",
+            schema=RunbookCandidate,
+        )
+        if not outcome.ok:
+            return {"steps": [], "mode": _reasoning_mode(
+                outcome, deterministic="deterministic_no_candidates", augmented="llm_candidates"
+            ), "outcome": outcome}
+        steps = []
+        for step in (outcome.value or {}).get("steps") or []:
+            proposed = str(step.get("action_type") or "").strip()
+            action_class = ACTION_CLASSES.get(proposed)
+            if action_class is None or not action_class.allowed:
+                # Deterministic action mapping: the platform's own vocabulary is
+                # the filter, so an unknown name cannot travel any further — and
+                # neither can a name the gate has already ruled out. The denied
+                # classes (``data_delete`` and friends) are keys of
+                # ``ACTION_CLASSES`` so the gate can *name* what it refused;
+                # listing one here would read as an endorsement of something the
+                # platform has decided never to run.
+                continue
+            steps.append(
+                {
+                    "description": str(step.get("description") or "")[:400],
+                    "action_type": proposed,
+                    "tool_name": action_class.tool_name,
+                    "proposed_requires_approval": bool(step.get("requires_approval", True)),
+                    "citation": step.get("citation"),
+                    # Advisory, and labelled as such at the field level rather
+                    # than only in a docstring nobody downstream will read.
+                    "advisory_only": True,
+                    # The deterministic requirement wins where the two disagree.
+                    # A model cannot mark a step approval-free that the action
+                    # class says needs one, but it may mark one as needing
+                    # approval that the class does not require.
+                    "requires_approval": bool(
+                        action_class.requires_approval or step.get("requires_approval", True)
+                    ),
+                }
+            )
+        return {"steps": steps[:5], "mode": "llm_candidates_advisory", "outcome": outcome}
 
 
 def _resolution_evidence(research_output: dict) -> list[dict]:
@@ -660,7 +795,7 @@ class ComplianceRiskAgent:
             "reason": "Policy and evidence sufficiency vote.",
             "reasoning_mode": "deterministic_policy",
         }
-        suggestion = _expert_json(
+        suggestion = _expert_call(
             self.name,
             (
                 "You are an independent enterprise compliance risk agent. Review policy evidence, approval "
@@ -673,6 +808,8 @@ class ComplianceRiskAgent:
                 "research": _research_digest(research_output),
                 "historical_failure_constraints": memory_constraints,
             },
+            operation="compliance_risk_vote",
+            schema=RiskVoteSuggestion,
         )
         vote = _apply_expert_risk_suggestion(vote, suggestion)
         vote["vote"] = "require_approval" if vote["needs_approval"] else "allow"
@@ -722,7 +859,7 @@ class OperationalRiskAgent:
             "reason": "Operational reversibility, evidence, and external-impact vote.",
             "reasoning_mode": "deterministic_policy",
         }
-        suggestion = _expert_json(
+        suggestion = _expert_call(
             self.name,
             (
                 "You are an independent operational risk agent. Review reversibility, external side effects, "
@@ -735,6 +872,8 @@ class OperationalRiskAgent:
                 "research": _research_digest(research_output),
                 "historical_failure_constraints": memory_constraints,
             },
+            operation="operational_risk_vote",
+            schema=RiskVoteSuggestion,
         )
         vote = _apply_expert_risk_suggestion(vote, suggestion)
         vote["vote"] = "require_approval" if vote["needs_approval"] else "allow"
@@ -973,7 +1112,7 @@ class CriticAgent:
                 if step.get("tool_name") in SIDE_EFFECT_TOOLS and step.get("status") == "completed"
             }
         )
-        llm_review = _expert_json(
+        review = _expert_call(
             self.name,
             (
                 "You are an independent quality critic for an enterprise agent workflow. Find only concrete "
@@ -994,8 +1133,12 @@ class CriticAgent:
                     for step in steps
                 ],
             },
+            operation="critic_review",
+            schema=CriticReviewResult,
         )
-        llm_findings = _valid_critic_findings((llm_review or {}).get("findings"))
+        llm_findings = _valid_critic_findings(
+            (review.value or {}).get("findings") if review.ok else None
+        )
         existing_codes = {str(finding.get("code")) for finding in findings}
         severity_penalty = {"low": 3, "medium": 7, "high": 12, "critical": 20}
         for finding in llm_findings:
@@ -1015,7 +1158,10 @@ class CriticAgent:
             "approval_denied_safely": approval_denied,
             "successful_side_effect_tools": successful_side_effect_tools,
             "safe_to_retry": not successful_side_effect_tools,
-            "reasoning_mode": "llm_augmented" if llm_review else "deterministic_quality_gate",
+            "reasoning_mode": _reasoning_mode(
+                review, deterministic="deterministic_quality_gate", augmented="llm_augmented"
+            ),
+            "llm": _llm_trace(review),
         }
 
 
@@ -1144,24 +1290,121 @@ class MemoryAgent:
         )
 
 
-def _expert_json(agent_name: str, system_prompt: str, payload: dict) -> dict | None:
+def _expert_call(
+    agent_name: str,
+    system_prompt: str,
+    payload: dict,
+    *,
+    operation: str,
+    schema: type | None = None,
+    max_tokens: int = 600,
+) -> LlmOutcome:
+    """Ask an expert agent's model a question and describe what came back.
+
+    This replaces ``_expert_json``, which returned ``None`` for three unrelated
+    situations — the LLM switched off, the call failing, and the call answering
+    something unreadable. Callers could only write ``if result is None``, so a
+    run that never contacted a model and a run whose model timed out produced
+    byte-identical agent payloads. The outcome object keeps them apart, and
+    every caller now reports which one it was (see :func:`_reasoning_mode`).
+
+    It never raises. A model is an enhancement to these agents, and an
+    enhancement that can take down the workflow it enhances is not one.
+
+    ``schema`` is passed through to :func:`app.services.llm.call_json`, which
+    validates against it and reports a validation failure as ``invalid_output``
+    rather than letting a malformed field reach a business decision.
+    """
     if not settings.llm_multi_agent_reasoning_enabled or not llm_ready():
-        return None
-    try:
-        return complete_json(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            temperature=0,
-            max_tokens=600,
+        return LlmOutcome(
+            status="disabled",
+            operation=operation,
+            provider=settings.llm_provider,
+            model=settings.llm_model,
         )
-    except LLMError as exc:
+    outcome = call_json(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        operation=operation,
+        schema=schema,
+        temperature=0,
+        max_tokens=max_tokens,
+    )
+    record_llm_call(outcome)
+    if outcome.failed:
         logger.warning(
             "multi_agent.expert_reasoning_failed",
-            extra={"event": "multi_agent.expert_reasoning_failed", "agent": agent_name, "error": str(exc)},
+            extra={
+                "event": "multi_agent.expert_reasoning_failed",
+                "agent": agent_name,
+                "operation": operation,
+                "status": outcome.status,
+                "error_type": outcome.error_type,
+                "error": outcome.error_message,
+                "latency_ms": outcome.latency_ms,
+                "retry_count": outcome.retry_count,
+            },
         )
-        return None
+    return outcome
+
+
+def _disabled_outcome(operation: str = "not_attempted") -> LlmOutcome:
+    """The outcome for a call that was never made, for reporting symmetry.
+
+    A path that deliberately skips the model still has to return *something*
+    shaped like a call record, or the payload's ``llm`` block would be missing
+    exactly where a reader most wants to know why nothing happened.
+    """
+    return LlmOutcome(
+        status="disabled",
+        operation=operation,
+        provider=settings.llm_provider,
+        model=settings.llm_model,
+    )
+
+
+def _reasoning_mode(outcome: LlmOutcome, *, deterministic: str, augmented: str) -> str:
+    """Name the path that actually produced this agent's answer.
+
+    Three states rather than two, because the old two-state version called a
+    *failed* call ``deterministic_...`` — which reads as "no model was
+    involved". One was; it just did not answer. Somebody debugging a quality
+    drop needs to tell "the LLM is off" apart from "the LLM is broken", and
+    that distinction is exactly what the section 十一 telemetry is for.
+    """
+    if outcome.ok:
+        return augmented
+    if outcome.failed:
+        return f"{deterministic}_llm_failed"
+    return deterministic
+
+
+def _llm_trace(outcome: LlmOutcome) -> dict:
+    """The model call recorded inside the agent payload, in one fixed shape.
+
+    Identical across all five call sites on purpose: a reader comparing the
+    compliance agent's payload with the critic's should not have to learn two
+    vocabularies. Token counts are reported with ``available`` beside them so a
+    provider that returns no usage is not silently read as having cost nothing.
+    """
+    return {
+        "status": outcome.status,
+        "operation": outcome.operation,
+        "provider": outcome.provider,
+        "model": outcome.model,
+        "latency_ms": round(outcome.latency_ms, 2),
+        "retry_count": outcome.retry_count,
+        "fallback_used": outcome.fallback_used,
+        "error_type": outcome.error_type,
+        "usage": {
+            "available": outcome.usage_available,
+            "prompt_tokens": outcome.prompt_tokens,
+            "completion_tokens": outcome.completion_tokens,
+            "total_tokens": outcome.total_tokens,
+        },
+    }
 
 
 def _merge_evidence(enterprise_results: list[dict], local_results: list[dict]) -> list[dict]:
@@ -1211,10 +1454,39 @@ def _research_digest(research_output: dict) -> dict:
     }
 
 
-def _apply_expert_risk_suggestion(vote: dict, suggestion: dict | None) -> dict:
-    if not suggestion:
-        return vote
+def _apply_expert_risk_suggestion(vote: dict, outcome: LlmOutcome) -> dict:
+    """Merge an independent risk vote into the deterministic one. Escalate-only.
+
+    Every branch here can raise risk or add a warning and none can lower
+    either, which is what makes the LLM's participation in risk *advisory* in
+    the strong sense rather than the polite one. ``needs_approval`` is
+    ``or``-ed with the deterministic value, so a model that answers "false",
+    says nothing, or answers something unreadable produces the same result: the
+    requirement the code already had.
+
+    Three things are checked in code before anything is merged, because §七
+    requires the model's vocabulary to be one this platform already has:
+
+    * ``risk_level`` must be a key of :data:`RISK_ORDER`, compared by rank
+      rather than by string;
+    * ``needs_approval`` arrives already narrowed to ``bool | None`` by
+      :class:`RiskVoteSuggestion`, which refuses to read an unrecognised value
+      as "no";
+    * ``warnings`` are strings and are not interpreted.
+
+    The reasoning mode is reported from the outcome rather than asserted, so a
+    payload cannot claim ``llm_augmented`` for a call that failed.
+    """
     result = dict(vote)
+    result["reasoning_mode"] = _reasoning_mode(
+        outcome,
+        deterministic="deterministic_policy",
+        augmented="llm_augmented",
+    )
+    result["llm"] = _llm_trace(outcome)
+    if not outcome.ok:
+        return result
+    suggestion = outcome.value or {}
     suggested_risk = str(suggestion.get("risk_level") or "").lower()
     current_risk = str(result.get("risk_level") or "low")
     if suggested_risk in RISK_ORDER and RISK_ORDER[suggested_risk] > RISK_ORDER.get(current_risk, 0):
@@ -1229,7 +1501,6 @@ def _apply_expert_risk_suggestion(vote: dict, suggestion: dict | None) -> dict:
     confidence = suggestion.get("confidence")
     if isinstance(confidence, (int, float)):
         result["confidence"] = max(0.0, min(float(confidence), 1.0))
-    result["reasoning_mode"] = "llm_augmented"
     return result
 
 

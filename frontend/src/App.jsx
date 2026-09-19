@@ -7,6 +7,7 @@ import {
   ClipboardList,
   Database,
   FileClock,
+  FlaskConical,
   Gauge,
   GitBranch,
   Home,
@@ -36,6 +37,10 @@ import {
   openEventStream,
   startOidcLogin,
 } from "./api.js";
+
+import { ITChain } from "./ITChain.jsx";
+import { ShowcasePage } from "./ShowcasePage.jsx";
+import { Card, IconButton, PanelHeader, Status, short } from "./ui.jsx";
 
 const USER_DEFAULT = { userId: "alice", password: "AlicePass123" };
 const ADMIN_DEFAULT = { userId: "admin", password: "AdminPass123" };
@@ -246,7 +251,13 @@ export default function App() {
     setRoute("/login");
   };
 
-  const page = route.startsWith("/admin") ? "admin" : route.startsWith("/login") ? "login" : "workspace";
+  const page = route.startsWith("/admin")
+    ? "admin"
+    : route.startsWith("/showcase")
+      ? "showcase"
+      : route.startsWith("/login")
+        ? "login"
+        : "workspace";
   const canOpenAdmin = user ? APPROVER_ROLES.has(user.role) : false;
   const visibleUser = page === "admin" && !canOpenAdmin ? null : user;
 
@@ -282,6 +293,11 @@ export default function App() {
             }}
           />
         )
+      ) : page === "showcase" ? (
+        // Rendered whether or not a session exists: the classification reads
+        // fine anonymously, and the run buttons surface the 401 the API gives
+        // rather than hiding the page behind a login wall.
+        <ShowcasePage user={user} canDecide={canOpenAdmin} onLoggedIn={setUser} onMessage={setMessage} />
       ) : user ? (
         <Workspace user={user} onMessage={setMessage} />
       ) : (
@@ -305,12 +321,21 @@ function TopNav({ page, user, onNavigate, onLogout, message }) {
         <SparkIcon />
         <span>
           <strong>企业 Agent 平台</strong>
-          <small>{page === "admin" ? "后台控制台" : page === "login" ? "登录" : "业务工作台"}</small>
+          <small>
+            {page === "admin"
+              ? "后台控制台"
+              : page === "showcase"
+                ? "能力展示"
+                : page === "login"
+                  ? "登录"
+                  : "业务工作台"}
+          </small>
         </span>
       </button>
       <nav className="nav-actions" aria-label="页面导航">
         <NavButton active={page === "workspace"} icon={Home} label="用户端" onClick={() => onNavigate("/")} />
         <NavButton active={page === "admin"} icon={ShieldCheck} label="后台端" onClick={() => onNavigate("/admin")} />
+        <NavButton active={page === "showcase"} icon={FlaskConical} label="能力展示" onClick={() => onNavigate("/showcase")} />
         {message ? <span className="top-message">{message}</span> : null}
         {user ? (
           <>
@@ -988,34 +1013,9 @@ function RetentionPanel({ plan, busy, isAdmin, onApply }) {
   );
 }
 
-function Card({ className = "", children }) {
-  return <section className={`card ${className}`}>{children}</section>;
-}
-
-function PanelHeader({ icon: Icon, title, kicker }) {
-  return (
-    <div className="panel-header">
-      <div className="panel-title">
-        <Icon size={18} />
-        <h2>{title}</h2>
-      </div>
-      {kicker ? <span className="kicker">{kicker}</span> : null}
-    </div>
-  );
-}
-
 function NavButton({ active, icon: Icon, label, onClick }) {
   return (
     <button className={`nav-button ${active ? "active" : ""}`} type="button" onClick={onClick}>
-      <Icon size={16} />
-      {label}
-    </button>
-  );
-}
-
-function IconButton({ icon: Icon, label, onClick, disabled = false, variant = "primary" }) {
-  return (
-    <button className={`action-button ${variant}`} type="button" onClick={onClick} disabled={disabled}>
       <Icon size={16} />
       {label}
     </button>
@@ -1258,251 +1258,6 @@ function ITServicePanel({ user, onMessage }) {
         <Empty text="提交一个 IT 请求后，这里会显示从工单到执行结果的完整链路" />
       )}
     </div>
-  );
-}
-
-function ITChain({ chain, canDecide, role, busy, onDecide, onRefresh }) {
-  const ticket = chain.ticket || {};
-  const triage = chain.triage || {};
-  const resolution = chain.resolution || {};
-  const risk = chain.risk_decision || {};
-  const execution = chain.execution || {};
-  const approval = chain.approval || null;
-  const history = resolution.historical_evidence || [];
-  const knowledge = resolution.evidence || [];
-
-  const steps = [
-    {
-      key: "ticket",
-      title: "Ticket 受理",
-      state: "done",
-      detail: (
-        <>
-          <code>{ticket.id}</code> · <Status value={ticket.status} /> · {ticket.priority || "-"} ·{" "}
-          {ticket.asset_id || "无关联资产"}
-        </>
-      ),
-    },
-    {
-      key: "triage",
-      title: "Triage 分类",
-      state: triage.category ? "done" : "todo",
-      detail: (
-        <>
-          {triage.intent || "-"} · {triage.category || "-"} · {triage.priority || "-"} · 环境{" "}
-          {triage.entities?.environment || "未标注"}
-          {triage.missing_information?.length ? ` · 缺失信息 ${triage.missing_information.join("、")}` : ""}
-        </>
-      ),
-    },
-    {
-      key: "knowledge",
-      title: "Knowledge 检索（正式知识 / 政策 / Runbook）",
-      state: knowledge.length ? "done" : "todo",
-      detail: (
-        <ITEvidenceList
-          tone="knowledge"
-          items={knowledge.map((item) => ({
-            key: item.article_id || item.title,
-            title: item.title,
-            meta: `${item.source || "-"} · score ${item.score ?? "-"}`,
-            body: item.snippet,
-          }))}
-          empty="未检索到可引用的正式知识"
-        />
-      ),
-    },
-    {
-      key: "history",
-      title: "Historical Ticket 检索（历史工单，仅供参考）",
-      state: history.length ? "done" : "todo",
-      detail: (
-        <>
-          <div className="it-badges">
-            <span className={`it-badge ${resolution.historical_reference ? "warn" : "muted"}`}>
-              historical_reference={String(Boolean(resolution.historical_reference))}
-            </span>
-            <span className={`it-badge ${resolution.historical_divergence ? "warn" : "muted"}`}>
-              historical_divergence={String(Boolean(resolution.historical_divergence))}
-            </span>
-          </div>
-          <ITEvidenceList
-            tone="historical"
-            items={history.map((item) => ({
-              key: item.ticket_id,
-              title: `${item.ticket_id} · ${item.title}`,
-              meta: `${item.category || "-"} · ${item.environment || "-"} · similarity ${item.similarity ?? "-"} · 当时的动作 ${item.resolution_action || "-"}`,
-              body: item.snippet,
-            }))}
-            empty="未检索到相似历史工单"
-          />
-          {resolution.historical_note ? <p className="muted">{resolution.historical_note}</p> : null}
-        </>
-      ),
-    },
-    {
-      key: "resolution",
-      title: "Resolution 决议",
-      state: resolution.status ? "done" : "todo",
-      detail: (
-        <>
-          <Status value={resolution.status} /> · {resolution.action_type || "-"} · 目标{" "}
-          {resolution.target || "-"} · 环境 {resolution.environment || "-"}
-          <p>{short(resolution.diagnosis, 220) || "没有可用证据，因此没有给出诊断。"}</p>
-        </>
-      ),
-    },
-    {
-      key: "risk",
-      title: "Risk Gate 风险门禁",
-      state: risk.decision ? "done" : "todo",
-      detail: (
-        <>
-          <Status value={risk.decision} /> · {risk.rule_id || "-"} · executable=
-          {String(Boolean(risk.executable))} · 工具 {risk.tool_name || "-"}
-          <ul className="it-list">
-            {(risk.reasons || []).map((reason) => (
-              <li key={reason}>{reason}</li>
-            ))}
-          </ul>
-        </>
-      ),
-    },
-    {
-      key: "approval",
-      title: "Approval 人工审批",
-      // Three states, not two: no approval needed, one waiting, one decided.
-      state: approval ? (approval.status === "pending" ? "waiting" : "done") : "done",
-      detail: approval ? (
-        <>
-          <Status value={approval.status} /> · {approval.action_type} · 工具 {approval.tool_name || "-"}
-          {approval.decided_by ? ` · 决策人 ${approval.decided_by}` : ""}
-          {approval.reason ? <p className="muted">{approval.reason}</p> : null}
-          {approval.status === "pending" ? (
-            <div className="approval-actions">
-              <IconButton
-                icon={Check}
-                label={busy === `decide:${approval.id}` ? "提交中" : "批准执行"}
-                disabled={!canDecide || Boolean(busy)}
-                onClick={() => onDecide(approval.id, true)}
-              />
-              <IconButton
-                icon={X}
-                label="拒绝"
-                variant="danger"
-                disabled={!canDecide || Boolean(busy)}
-                onClick={() => onDecide(approval.id, false)}
-              />
-            </div>
-          ) : null}
-          {approval.status === "pending" && !canDecide ? (
-            <p className="muted">当前账号角色为 {role}，无权审批；请以 manager / admin 身份登录。</p>
-          ) : null}
-        </>
-      ) : (
-        <p className="muted">风控判定为自动执行，无需人工审批。</p>
-      ),
-    },
-    {
-      key: "tool",
-      title: "Tool Execution 工具执行",
-      state: execution?.executed ? "done" : approval?.status === "pending" ? "waiting" : "todo",
-      // Four distinct answers, not two. "Nothing ran because a human has not
-      // decided yet" and "nothing ran because there was nothing runnable" look
-      // identical if you only test ``executed``, and they mean opposite things
-      // to whoever is reading the ticket.
-      detail: execution?.executed ? (
-        <>
-          <Status value="executed" /> · {execution.tool_name} · {execution.arguments?.asset_id || execution.target || "-"} ·
-          执行账号 {execution.executed_by || "-"} · 请求人 {execution.requested_by || "-"}
-        </>
-      ) : approval?.status === "pending" ? (
-        <>
-          <Status value="not_yet" />
-          <p>等待人工审批，尚未执行任何工具。</p>
-        </>
-      ) : approval?.status === "denied" ? (
-        <>
-          <Status value="not_executed" />
-          <p>审批被拒绝：{execution?.reason || "approval_denied"}，未执行任何工具。</p>
-        </>
-      ) : risk.decision === "deny" ? (
-        <>
-          <Status value="not_executed" />
-          <p>风险门禁拒绝：{execution?.reason || "risk_deny"}，未执行任何工具。</p>
-        </>
-      ) : (
-        <>
-          <Status value="not_executed" />
-          <p>未执行：{execution?.reason || "no_action"}（没有可执行的工具动作，不编造解决方案）。</p>
-        </>
-      ),
-    },
-    {
-      key: "audit",
-      title: "Final Status 与审计链",
-      state: ["resolved", "rejected", "closed"].includes(ticket.status) ? "done" : "waiting",
-      detail: (
-        <>
-          <Status value={ticket.status} />
-          <ol className="it-audit">
-            {(chain.audit || []).map((row) => (
-              <li key={row.id}>
-                <code>{row.event_type}</code>
-                <span className="muted">
-                  {row.actor} · {(row.created_at || "").slice(11, 19)}
-                </span>
-              </li>
-            ))}
-          </ol>
-          <IconButton icon={RefreshCw} label="刷新链路" variant="ghost" onClick={onRefresh} />
-        </>
-      ),
-    },
-  ];
-
-  // The same ``.progress-step`` markup and styling as ``ProgressTimeline``, but
-  // rendered here rather than through it: that component wraps each detail in a
-  // ``<p>``, and these details contain lists and blocks. A ``<div>`` inside a
-  // ``<p>`` is invalid HTML that the browser silently restructures, which would
-  // have looked like a styling bug rather than the markup error it is.
-  return (
-    <div className="progress-timeline it-timeline">
-      {steps.map((step, index) => (
-        <div className={`progress-step ${step.state}`} key={step.key}>
-          <span className="progress-index">{index + 1}</span>
-          <div className="it-step">
-            <strong>{step.title}</strong>
-            <div className="it-step-detail">{step.detail}</div>
-          </div>
-        </div>
-      ))}
-      <ITEvidenceNote />
-    </div>
-  );
-}
-
-function ITEvidenceList({ tone, items, empty }) {
-  if (!items.length) return <p className="muted">{empty}</p>;
-  return (
-    <ul className={`it-evidence ${tone}`}>
-      {items.map((item) => (
-        <li key={item.key}>
-          <strong>{item.title}</strong>
-          <span className="muted">{item.meta}</span>
-          {item.body ? <p>{short(item.body, 200)}</p> : null}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function ITEvidenceNote() {
-  // §六's separation, stated where a reader of the UI will actually meet it.
-  return (
-    <p className="it-evidence-note">
-      正式知识（政策 / Runbook）是执行依据；历史工单只是过去的处理经验，仅作参考，不构成政策，也不会被用来选择动作。
-    </p>
   );
 }
 
@@ -2132,10 +1887,6 @@ function DecisionSummary({ decision }) {
   );
 }
 
-function Status({ value }) {
-  return <span className={`status ${value || ""}`}>{value || "unknown"}</span>;
-}
-
 function RunCard({ run, admin = false, onReplay }) {
   const agents = run.messages || [];
   const tasks = run.tasks || [];
@@ -2663,11 +2414,6 @@ function formatScore(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "-";
   return number <= 1 ? `${Math.round(number * 100)}%` : number.toFixed(2);
-}
-
-function short(value, limit = 160) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
 }
 
 function statusLabel(status) {

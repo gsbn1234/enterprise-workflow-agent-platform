@@ -137,11 +137,17 @@ class CustomerInteractionCreate(BaseModel):
 
 
 class KnowledgeArticleCreate(BaseModel):
+    """No ``visibility`` field on purpose -- see ``create_article``.
+
+    Unknown fields are ignored rather than rejected, so a client that still
+    sends ``visibility`` keeps working; the value is simply not stored, which is
+    the honest behaviour given that nothing filters on it.
+    """
+
     title: str
     category: str
     content: str
     tags: str = ""
-    visibility: str = "internal"
 
 
 class ToolCallRequest(BaseModel):

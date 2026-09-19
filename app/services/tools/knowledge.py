@@ -13,7 +13,23 @@ from app.services.audit import record_audit
 from app.utils import compact_text, new_id, utc_now
 
 
-def create_article(title: str, category: str, content: str, tags: str = "", visibility: str = "internal") -> dict:
+def create_article(title: str, category: str, content: str, tags: str = "") -> dict:
+    """Create one knowledge article.
+
+    There is deliberately no ``visibility`` argument here, and no such field on
+    the request schema either. **This version does not implement
+    visibility-based access control.** ``knowledge_articles.visibility`` is not
+    read by :func:`get_article`, :func:`list_articles` or
+    :func:`search_knowledge` -- all three are unconditional ``SELECT *`` -- so a
+    parameter named ``visibility`` on the writer advertised a control that did
+    not exist. Anything marked ``restricted`` was still returned to everyone.
+
+    The column itself stays for now: dropping it is a migration this version
+    does not need, and the conservative change is to stop pretending rather than
+    to move data. Every row written here is ``'internal'``, which is what the
+    old default produced anyway, so nothing already stored or retrieved changes.
+    Do not read access-control meaning into the value.
+    """
     article_id = new_id("kb")
     now = utc_now()
     with get_connection() as conn:
@@ -21,9 +37,9 @@ def create_article(title: str, category: str, content: str, tags: str = "", visi
             """
             INSERT INTO knowledge_articles
             (id, title, category, content, tags, visibility, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'internal', ?, ?)
             """,
-            (article_id, title, category, content, tags, visibility, now, now),
+            (article_id, title, category, content, tags, now, now),
         )
     record_audit("knowledge.create", "knowledge_article", article_id, {"title": title, "category": category})
     return get_article(article_id)

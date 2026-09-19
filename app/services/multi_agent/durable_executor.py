@@ -51,7 +51,14 @@ from app.services.it.risk_gate import DECISION_DENY, DECISION_REQUIRE_APPROVAL
 from app.services.it.risk_gate import UNKNOWN_CRITICALITY, UNKNOWN_ENVIRONMENT
 from app.services.it.risk_gate import evaluate as evaluate_it_risk
 from app.services.it.risk_gate import merge_criticality, merge_environment
+from app.services.it.triage import ENVIRONMENTS, INTENTS, RESOURCE_CODES, SERVICE_CODES
+from app.services.it.triage import SOFTWARE_CODES, TriageResult
 from app.services.it.triage import classify as classify_it_request
+from app.services.it.triage import llm_fallback as triage_llm_fallback
+from app.services.it.triage import needs_llm_fallback
+from app.services.llm import call_json, llm_ready
+from app.services.llm_schemas import IntentFallbackResult
+from app.services.llm_telemetry import llm_context, record_llm_call
 from app.services.tenancy import effective_tenant_id
 from app.services.tools.registry import call_tool
 from app.services.tools.ticketing import update_ticket
@@ -181,7 +188,12 @@ def run_multi_agent_durable(
         initial_state["it_ticket_id"] = it_ticket_id
 
     try:
-        final_state = graph.invoke(initial_state, {"configurable": {"thread_id": thread_id}})
+        # Every model call made inside the graph is attributed to this run.
+        # The nodes themselves were never given a run id -- they read it from
+        # here -- so this one line is what makes ``multi_agent_run_id`` on
+        # ``llm_calls`` mean anything.
+        with llm_context(multi_agent_run_id=run_id, ticket_id=it_ticket_id):
+            final_state = graph.invoke(initial_state, {"configurable": {"thread_id": thread_id}})
         if final_state.get("__interrupt__"):
             _pause_run(run_id, started, final_state)
             record_audit(
@@ -228,7 +240,7 @@ def resume_multi_agent_for_workflow(workflow: dict) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT id, thread_id, requester_user_id, tenant_id
+            SELECT id, thread_id, requester_user_id, tenant_id, it_ticket_id
             FROM multi_agent_runs
             WHERE workflow_run_id = ? AND status = 'waiting_approval'
             ORDER BY created_at DESC
@@ -247,10 +259,14 @@ def resume_multi_agent_for_workflow(workflow: dict) -> dict | None:
     checkpointer.setup()
     graph = _build_graph(context).compile(checkpointer=checkpointer)
     try:
-        final_state = graph.invoke(
-            Command(resume={"workflow": workflow}),
-            {"configurable": {"thread_id": run["thread_id"]}},
-        )
+        # A resumed run asks the model just as often as a fresh one -- the
+        # triage fallback and the expert agents all run again on this pass --
+        # so it announces itself the same way, keeping the run's own ticket.
+        with llm_context(multi_agent_run_id=run["id"], ticket_id=run.get("it_ticket_id")):
+            final_state = graph.invoke(
+                Command(resume={"workflow": workflow}),
+                {"configurable": {"thread_id": run["thread_id"]}},
+            )
         if final_state.get("__interrupt__"):
             _pause_run(run["id"], started, final_state)
         else:
@@ -394,13 +410,43 @@ def _it_triage_node(state: MultiAgentState, context: DurableRunContext) -> dict:
     actor = state.get("requester_user_id") or "agent"
 
     def _triage() -> dict:
-        fresh = classify_it_request(objective).to_dict()
+        fresh_result = classify_it_request(objective)
+        fresh = fresh_result.to_dict()
         ticket = _it_ticket(state, ticket_id)
         stored = dict(ticket.get("triage") or {})
-        triage = {**fresh, **stored} if stored else fresh
+        source = "phase1_stored" if stored else "recomputed"
+        if stored:
+            # The reporter's own classification stands, and the objective here
+            # may have been re-worded since — a model must not get to silently
+            # reclassify a live incident off the back of that.
+            #
+            # It stands *unless it was itself unsure*. A stored triage below the
+            # confidence bar is exactly the case the fallback exists for, and
+            # the stored reading is what the model is given as its base: every
+            # stored value wins, the model may only fill gaps, and priority and
+            # needs_approval stay escalate-only. So the run can proceed on a
+            # refined reading but never on a laxer one. The ticket row itself is
+            # not rewritten — the refinement belongs to this run, and the audit
+            # below records it as such.
+            triage = {**fresh, **stored}
+            base = _triage_result_from(triage)
+            fallback_trace = None
+            if needs_llm_fallback(base, settings.llm_triage_min_confidence):
+                merged, fallback_trace = _it_triage_fallback(
+                    objective, base, ticket_id=ticket_id, actor=actor, tenant_id=tenant_id
+                )
+                # ``_it_triage_fallback`` hands back the base unchanged whenever
+                # the call failed or the answer was unusable, so only a merge
+                # that actually happened is allowed to replace the reading.
+                if merged.get("mode") == "llm_assisted":
+                    triage = merged
+                    source = "phase1_stored_llm_assisted"
+        else:
+            triage, fallback_trace = _it_triage_fallback(
+                objective, fresh_result, ticket_id=ticket_id, actor=actor, tenant_id=tenant_id
+            )
         entities = dict(triage.get("entities") or {})
         query = _it_research_query(objective, entities)
-        source = "phase1_stored" if stored else "recomputed"
         record_audit(
             "it.triage_classified",
             "ticket",
@@ -415,6 +461,7 @@ def _it_triage_node(state: MultiAgentState, context: DurableRunContext) -> dict:
                 "confidence": triage.get("confidence"),
                 "mode": triage.get("mode"),
                 "source": source,
+                "llm": fallback_trace,
             },
             actor=actor,
             tenant_id=tenant_id,
@@ -441,6 +488,7 @@ def _it_triage_node(state: MultiAgentState, context: DurableRunContext) -> dict:
             "research_query": query,
             "source": source,
             "producer": "it_triage",
+            "llm": fallback_trace,
         }
 
     content = _run_agent_message(
@@ -455,6 +503,177 @@ def _it_triage_node(state: MultiAgentState, context: DurableRunContext) -> dict:
     update = {"it_triage": content, "it_research_query": content.get("research_query") or objective}
     _record_checkpoint(context, "it_triage", {**state, **update})
     return update
+
+
+def _triage_result_from(stored: dict) -> TriageResult:
+    """Rehydrate a persisted triage dict so the fallback gate can read it.
+
+    The gate takes a :class:`TriageResult` because that is what ``classify``
+    returns, but on the ticket-backed path the reading under consideration is
+    the one stored at intake — a plain dict that has been through JSON. Every
+    field is read defensively: an unrecognised intent or category is kept as
+    the string it is rather than blanked, since the fallback treats the base
+    as the reading to refine and a blank one would invite the model to fill in
+    more than it should.
+    """
+    entities = stored.get("entities")
+    missing = stored.get("missing_information")
+    return TriageResult(
+        intent=str(stored.get("intent") or ""),
+        category=str(stored.get("category") or ""),
+        priority=str(stored.get("priority") or ""),
+        entities=dict(entities) if isinstance(entities, dict) else {},
+        needs_approval=bool(stored.get("needs_approval")),
+        missing_information=list(missing) if isinstance(missing, list) else [],
+        confidence=float(stored.get("confidence") or 0.0),
+        mode=str(stored.get("mode") or "deterministic"),
+    )
+
+
+def _it_triage_fallback(
+    objective: str,
+    fresh: TriageResult,
+    *,
+    ticket_id: str,
+    actor: str,
+    tenant_id: str | None,
+) -> tuple[dict, dict | None]:
+    """Ask a model to re-read a request the keyword rules could not place.
+
+    This is the only place in the triage path where a model is consulted, and
+    it is a *fallback* in the literal sense: ``classify`` has already run and
+    already returned an answer. Nothing here can leave the run without a
+    triage, and the two ways this can go wrong — the call failing, and the call
+    answering in a vocabulary the platform does not have — both end with the
+    deterministic result being used unchanged.
+
+    Three conditions gate the call, and each is checked in code rather than
+    asked of the model:
+
+    * the fallback is switched on and the provider is reachable;
+    * the reading handed in came back below ``llm_triage_min_confidence``;
+    * that reading is ``deterministic`` rather than already ``llm_assisted`` —
+      one fallback per request, so a model cannot ask itself for a second
+      opinion.
+
+    ``fresh`` is whatever reading is under consideration, which is not always a
+    fresh ``classify`` call: the caller passes the *stored* triage when the
+    ticket already carries one, so the model refines the reading the reporter's
+    ticket was filed under rather than a re-reading of a possibly re-worded
+    objective. It is a :class:`TriageResult` either way, and the merge that
+    follows does not care which of the two it was handed.
+
+    Both outcomes are audited, including the rejection. A model that was asked
+    and whose answer was thrown away is exactly the event somebody reading the
+    trail later needs to see, and the rejection reason distinguishes "the call
+    failed" from "the call answered something that is not an intent".
+    """
+    if not settings.llm_triage_fallback_enabled or not llm_ready():
+        return fresh.to_dict(), None
+    if not needs_llm_fallback(fresh, settings.llm_triage_min_confidence):
+        return fresh.to_dict(), None
+
+    outcome = call_json(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You classify enterprise IT service requests. Read the request and return JSON with "
+                    "intent, and where the request supports it service, resource, environment, confidence "
+                    "and reason. intent must be exactly one of the supplied allowed values. service and "
+                    "environment must come from the supplied allowed values; omit a field rather than "
+                    "guessing. Do not invent details the request does not contain."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json_dumps(
+                    {
+                        "request": objective,
+                        "allowed_intents": list(INTENTS),
+                        "allowed_services": list(SERVICE_CODES),
+                        "allowed_resources": list(RESOURCE_CODES),
+                        "allowed_software": list(SOFTWARE_CODES),
+                        "allowed_environments": list(ENVIRONMENTS),
+                        "deterministic_reading": fresh.to_dict(),
+                    }
+                ),
+            },
+        ],
+        operation="it_triage_fallback",
+        schema=IntentFallbackResult,
+        temperature=0,
+        max_tokens=400,
+    )
+    record_llm_call(outcome, ticket_id=ticket_id)
+
+    if not outcome.ok:
+        record_audit(
+            "it.triage_llm_fallback_rejected",
+            "ticket",
+            ticket_id,
+            {
+                "reason": outcome.status,
+                "error_type": outcome.error_type,
+                "error": outcome.error_message,
+                "base_confidence": fresh.confidence,
+                "threshold": settings.llm_triage_min_confidence,
+            },
+            actor=actor,
+            tenant_id=tenant_id,
+        )
+        return fresh.to_dict(), _llm_trace(outcome)
+
+    merged = triage_llm_fallback(objective, fresh, outcome)
+    if merged is None:
+        record_audit(
+            "it.triage_llm_fallback_rejected",
+            "ticket",
+            ticket_id,
+            {
+                "reason": "intent_not_in_vocabulary",
+                "proposed_intent": str((outcome.value or {}).get("intent") or "")[:60],
+                "base_confidence": fresh.confidence,
+            },
+            actor=actor,
+            tenant_id=tenant_id,
+        )
+        return fresh.to_dict(), _llm_trace(outcome)
+
+    record_audit(
+        "it.triage_llm_fallback_accepted",
+        "ticket",
+        ticket_id,
+        {
+            "base": fresh.to_dict(),
+            "merged": merged.to_dict(),
+            "model_confidence": (outcome.value or {}).get("confidence"),
+            "reason": str((outcome.value or {}).get("reason") or "")[:300],
+        },
+        actor=actor,
+        tenant_id=tenant_id,
+    )
+    return merged.to_dict(), _llm_trace(outcome)
+
+
+def _llm_trace(outcome) -> dict:
+    """The same fixed call record the agent payloads carry, for the audit row."""
+    return {
+        "status": outcome.status,
+        "operation": outcome.operation,
+        "provider": outcome.provider,
+        "model": outcome.model,
+        "latency_ms": round(outcome.latency_ms, 2),
+        "retry_count": outcome.retry_count,
+        "fallback_used": outcome.fallback_used,
+        "error_type": outcome.error_type,
+        "usage": {
+            "available": outcome.usage_available,
+            "prompt_tokens": outcome.prompt_tokens,
+            "completion_tokens": outcome.completion_tokens,
+            "total_tokens": outcome.total_tokens,
+        },
+    }
 
 
 def _it_research_query(objective: str, entities: dict) -> str:

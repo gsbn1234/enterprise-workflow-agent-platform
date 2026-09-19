@@ -16,7 +16,8 @@ from app.services.it.execution import (
     execute_it_action,
 )
 from app.services.it.risk_gate import DECISION_DENY, DECISION_REQUIRE_APPROVAL
-from app.services.llm import polish_agent_answer
+from app.services.llm import LlmOutcome, polish_agent_answer_outcome
+from app.services.llm_telemetry import llm_context, record_llm_call
 from app.services.observability import start_span
 from app.services.requests import get_business_request, update_business_request_status
 from app.services.tenancy import effective_tenant_id
@@ -26,7 +27,15 @@ from app.services.tools.email import draft_email, send_email
 from app.services.tools.knowledge import query_enterprise_rag, search_knowledge
 from app.services.tools.notifications import notify_internal_team
 from app.services.tools.ticketing import create_ticket, update_ticket
-from app.utils import compact_text, estimate_token_cost, json_dumps, json_loads, new_id, utc_now
+from app.utils import (
+    compact_text,
+    estimate_token_cost,
+    json_dumps,
+    json_loads,
+    new_id,
+    token_cost,
+    utc_now,
+)
 
 
 logger = logging.getLogger("agent_platform.workflow")
@@ -832,7 +841,12 @@ def _run_step(
                     "workflow.attempt": attempt_index,
                 },
             ):
-                output = fn()
+                # The planner is the only model call this layer makes, and it
+                # is reached through a lambda from here. Announcing the run at
+                # the step boundary attributes it without giving
+                # ``plan_workflow`` a run id it has no other use for.
+                with llm_context(workflow_run_id=context.run_id):
+                    output = fn()
             attempts.append(
                 {
                     "attempt": attempt_index,
@@ -1007,6 +1021,31 @@ def _set_run_classification(run_id: str, category: str, risk_level: str, needs_a
         )
 
 
+def _run_cost(run_before: dict, final_answer: str, polish: LlmOutcome) -> float:
+    """What to add to this run's ``cost_estimate``, from real usage if there is any.
+
+    The column has always been an estimate — the schema, the metrics endpoint
+    (``estimated_cost``) and the evaluation summary (``avg_cost_estimate``) all
+    name it that way — so keeping the old calculation as the fallback is not a
+    regression. What changes is that a provider which reports usage is now
+    believed over the guess. ``estimate_token_cost`` divides the answer's
+    character count by four and prices the result, which is a demonstration
+    figure and says so in its own docstring; this platform now mostly answers
+    from code, so that divisor described a quantity that had little to do with
+    what the model was actually sent.
+
+    The two are never mixed inside one number. Either the call reported tokens
+    and the cost is derived from those, or it did not and the estimate stands
+    unchanged. Which of the two produced any given total is recorded per call
+    as ``llm_calls.usage_available``.
+    """
+    if polish.usage_available and polish.total_tokens is not None:
+        reported = token_cost(polish.total_tokens)
+        if reported is not None:
+            return reported
+    return estimate_token_cost(final_answer)
+
+
 def _complete_run(
     run_id: str,
     *,
@@ -1018,15 +1057,16 @@ def _complete_run(
 ) -> None:
     latency_ms = int((time.perf_counter() - started) * 1000) if started is not None else 0
     run_before = _get_run_row(run_id) or {}
-    polished_answer = polish_agent_answer(
+    polish = polish_agent_answer_outcome(
         final_answer,
         status=status,
         category=run_before.get("category"),
         risk_level=run_before.get("risk_level"),
     )
-    if polished_answer:
-        final_answer = polished_answer
-    cost = estimate_token_cost(final_answer)
+    record_llm_call(polish, workflow_run_id=run_id)
+    if polish.ok and polish.value:
+        final_answer = str(polish.value)
+    cost = _run_cost(run_before, final_answer, polish)
     completed_at = None if status == "waiting_approval" else utc_now()
     with get_connection() as conn:
         conn.execute(

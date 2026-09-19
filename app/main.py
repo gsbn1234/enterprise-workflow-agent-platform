@@ -60,6 +60,7 @@ from app.services.auth import (
 from app.services.eval_reports import list_eval_reports
 from app.services.jobs import create_workflow_job, get_workflow_job, list_workflow_jobs, process_next_job, retry_workflow_job
 from app.services.llm import llm_status
+from app.services.llm_telemetry import llm_usage_summary
 from app.services.metrics import metrics_summary, prometheus_metrics
 from app.services.multi_agent import (
     diff_trace,
@@ -119,6 +120,7 @@ from app.services.tools.crm import (
 from app.services.tools.email import list_emails
 from app.services.tools.knowledge import create_article, list_articles, search_knowledge
 from app.services.tools.registry import call_tool, list_tool_specs
+from app.services.it.demo_scenarios import list_it_demo_scenarios
 from app.services.it.intake import original_request_text, submit_it_request
 from app.services.it.triage import classify
 from app.services.tools.ticketing import (
@@ -281,6 +283,14 @@ def login_page() -> FileResponse:
     return _frontend_entry()
 
 
+@app.get("/showcase")
+def showcase_page() -> FileResponse:
+    """Phase 6 showcase. Relies on the frontend's hand-rolled router, and on the
+    same ``_frontend_entry`` fallback as ``/`` and ``/admin`` -- there is no
+    catch-all route, so a new client-side path needs a server-side twin."""
+    return _frontend_entry()
+
+
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon() -> Response:
     return Response(status_code=204)
@@ -328,6 +338,16 @@ def readiness() -> dict:
 @app.get("/api/demo-scenarios")
 def demo_scenarios() -> list[dict]:
     return list_demo_scenarios()
+
+
+@app.get("/api/it/demo-scenarios")
+def it_demo_scenarios() -> dict:
+    """Scenarios for the Phase 6 showcase, projected from the committed IT
+    evaluation suite rather than restated. Read-only static metadata, so it is
+    anonymous like ``/api/demo-scenarios``; every call it advertises requires a
+    token of its own.
+    """
+    return list_it_demo_scenarios()
 
 
 @app.get("/api/events")
@@ -446,7 +466,13 @@ def metrics_endpoint(auth_context: AuthContext | None = Depends(_optional_auth_c
         raise HTTPException(status_code=404, detail="Metrics are disabled.")
     if settings.metrics_auth_required and not auth_context:
         raise HTTPException(status_code=401, detail="Metrics require authentication.")
-    return Response(prometheus_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
+    # Same scope helper as ``/api/metrics/summary``. The dependency above has
+    # already resolved who is scraping; without this the identity was discarded
+    # and an authenticated tenant read every tenant's counters.
+    return Response(
+        prometheus_metrics(_tenant_scope(auth_context)),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 def _ensure_admin_when_auth_required(auth_context: AuthContext | None) -> None:
@@ -1146,7 +1172,7 @@ def knowledge(limit: int = 100, auth_context: AuthContext | None = Depends(_opti
 @app.post("/api/knowledge")
 def add_knowledge(article: KnowledgeArticleCreate, auth_context: AuthContext | None = Depends(_optional_auth_context)) -> dict:
     _ensure_admin_when_auth_required(auth_context)
-    return create_article(article.title, article.category, article.content, article.tags, article.visibility)
+    return create_article(article.title, article.category, article.content, article.tags)
 
 
 @app.get("/api/knowledge/search")
@@ -1381,7 +1407,19 @@ def audit_logs(limit: int = 100, auth_context: AuthContext | None = Depends(_opt
 
 @app.get("/api/metrics/summary")
 def metrics(auth_context: AuthContext | None = Depends(_optional_auth_context)) -> dict:
-    return metrics_summary(_tenant_scope(auth_context))
+    tenant_id = _tenant_scope(auth_context)
+    return {
+        **metrics_summary(tenant_id),
+        # What the models cost, next to what the workflows did. Same tenant
+        # scope and same gating as the rest of this payload — LLM spend is not
+        # a more sensitive number than the cost estimate already in ``totals``.
+        #
+        # ``usage_available_calls`` sits beside ``calls`` on purpose: a token
+        # total computed from a subset of calls is only readable next to the
+        # size of that subset, and a dashboard that reads NULL as 0 will
+        # understate spend silently.
+        "llm_usage": llm_usage_summary(tenant_id),
+    }
 
 
 @app.get("/api/eval-reports")

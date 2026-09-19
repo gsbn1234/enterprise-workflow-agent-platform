@@ -8,6 +8,17 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
 
+    env:
+      # Every smoke suite answers the model itself, by swapping out
+      # ``llm._post`` or by running with ``AGENT_LLM_ENABLED=false``, so no step
+      # here needs a provider. This points the client at a host that cannot
+      # resolve, which makes that guarantee falsifiable: a test that
+      # accidentally reaches the real path fails loudly in CI instead of
+      # quietly depending on a network and, worse, on somebody's API key.
+      AGENT_LLM_BASE_URL: "http://llm.invalid/v1"
+      AGENT_LLM_PROVIDER: "openai_compatible"
+      AGENT_LLM_API_KEY: "unused-in-ci"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -85,6 +96,26 @@ jobs:
         # gate, so it exits 0 and the numbers are read.
         run: python scripts/evaluate.py --suite it
 
+      - name: LLM engineering smoke
+        # Phase 5-1 / UP-1. Fourteen ways a model can fail — switched off,
+        # unreachable, too slow, prose instead of JSON, JSON in a vocabulary
+        # this platform does not have — and what survives each one. Answered by
+        # a fake transport over ``llm._post``, so it needs no provider and no
+        # network; ``AGENT_LLM_BASE_URL`` points at a host that does not
+        # resolve, so a test that accidentally reaches the real path fails
+        # loudly.
+        #
+        # The last third is the part that matters: it checks not that the model
+        # behaves but that the model *cannot*, however it behaves — a suggested
+        # resolution still meets the risk gate, a risk vote saying "no approval
+        # needed" cannot remove one, and no amount of prompting produces a tool
+        # call. Reverting any of those bounds turns a case here red.
+        #
+        # UP-1 added the attribution cases: a live run's every row must name the
+        # run it came from, including the calls made deep inside agents that
+        # were never handed a run id.
+        run: python scripts/llm_engineering_smoke_test.py
+
       - name: MCP-style tool service smoke
         run: python scripts/mcp_smoke_test.py
 
@@ -117,6 +148,9 @@ jobs:
 
       - name: Prometheus metrics smoke
         run: python scripts/metrics_smoke_test.py
+
+      - name: Prometheus metrics tenant isolation smoke
+        run: python scripts/metrics_tenant_isolation_smoke_test.py
 
       - name: Trace context smoke
         run: python scripts/trace_context_smoke_test.py

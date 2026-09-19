@@ -1179,7 +1179,7 @@ baseline 里 `deny_case_count = 1`、`reject_case_count = 3` ——
    **精确断言这条残余**（失败项集合必须恰好是 `["retrieval_ok"]`），而不是删掉或调松它。
 3. **「文本写生产、资产是 staging」的过度升级不修**（选择「只收紧」）：仍会走人工审批。
    **它安全，只是不经济。** 作为同一根因的反方向对照保留。
-4. **`it_historical_tickets` 不在 `TENANT_RLS_TABLES` 里**（仍 **16** 表）。
+4. **`it_historical_tickets` 不在 `TENANT_RLS_TABLES` 里**（仍 **17** 表）。
    租户隔离由工具的 SQL `tenant_id = ?` 承担，与 `query_tickets` 同一契约；
    改表清单会动到 `postgres_rls_smoke_test` 可能精确断言的集合，风险大于收益。
 5. **`similarity` 会因 category 加分饱和到 1.0** —— 它是可解释的确定性分数，
@@ -1370,7 +1370,7 @@ it.request_submitted → it.triage_classified → it.research_query_built
 | **8** | `ACTION_CLASSES` 动作类数（含 3 个 DENY 类） |
 | **R0–R7** | 确定性风险门禁的规则级联（含 R3b，共 9 条规则） |
 | **7** | `evaluate()` 的 `inputs` 键数 / Phase 4 新增回归测试数 |
-| **16** | `TENANT_RLS_TABLES` 表数（`it_historical_tickets` **不在**其中） |
+| **17** | `TENANT_RLS_TABLES` 表数（`it_historical_tickets` **不在**其中） |
 | **18 / 3** | Phase 3 通过 / 失败（21 条） |
 | **20 / 1** | Phase 4 通过 / 失败（21 条） |
 | **0.8571 → 0.9524** | `pass_rate` |

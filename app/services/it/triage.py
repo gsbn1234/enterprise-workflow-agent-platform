@@ -19,7 +19,13 @@ loop can turn a triage result into an asset lookup without a mapping table.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Annotation only. ``classify`` and everything above it stay free of the
+    # HTTP client that :mod:`app.services.llm` pulls in; the fallback receives
+    # an outcome object and reads two attributes off it.
+    from app.services.llm import LlmOutcome
 
 
 INTENTS: tuple[str, ...] = (
@@ -554,3 +560,144 @@ def _match_environment(lowered: str) -> str | None:
 
 def _contains_any(lowered: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in lowered for keyword in keywords)
+
+
+# --- LLM fallback (Phase 5-1) ------------------------------------------------
+#
+# Everything above is deterministic and stays that way: ``classify`` consults no
+# model, and the two functions below are never called from it. They exist for
+# the one case keyword rules genuinely cannot serve — a request written in words
+# this module has no vocabulary for — and they are reached only from
+# ``_it_triage_node`` after ``classify`` has already produced an answer.
+#
+# The shape of the fallback is what keeps it safe. ``classify`` always returns a
+# usable result, so the model is never asked to *produce* a triage from nothing;
+# it is asked to improve one that came back unsure, and the improvement is then
+# merged into the deterministic result rather than replacing it.
+
+# The vocabularies the model's answer must be spelled in. Built from the
+# keyword tables above rather than written out again, so a service added to
+# ``SERVICE_KEYWORDS`` is automatically a service the fallback may name — and,
+# more importantly, one it may not invent.
+SERVICE_CODES: tuple[str, ...] = tuple(code for code, _ in SERVICE_KEYWORDS)
+RESOURCE_CODES: tuple[str, ...] = tuple(code for code, _ in RESOURCE_KEYWORDS)
+SOFTWARE_CODES: tuple[str, ...] = tuple(code for code, _ in SOFTWARE_KEYWORDS)
+ENVIRONMENTS: tuple[str, ...] = tuple(code for code, _ in ENVIRONMENT_KEYWORDS)
+
+
+def needs_llm_fallback(result: TriageResult, threshold: float) -> bool:
+    """Whether a deterministic triage came back unsure enough to ask a model.
+
+    Pure, and deliberately narrow: only a result produced by ``classify`` is
+    eligible. An ``llm_assisted`` result is not asked again — one fallback per
+    request, so a model that answers badly cannot trigger a second opinion that
+    answers differently.
+    """
+    if result.mode != "deterministic":
+        return False
+    return float(result.confidence) < float(threshold)
+
+
+def llm_fallback(
+    objective: str,
+    base: TriageResult,
+    outcome: "LlmOutcome",
+) -> TriageResult | None:
+    """Merge a model's reading of an unsure request into the deterministic one.
+
+    Returns ``None`` when the answer cannot be used, which leaves the caller
+    holding ``base`` — the deterministic result is never made worse by asking.
+
+    Three rules, in the order they are applied:
+
+    1. **The intent must be one this platform has.** §七 asks for exactly this:
+       a model may pick from ``INTENTS``, it may not add to it. An unrecognised
+       intent fails the whole answer, because a result whose intent is not in
+       the enum would go on to be counted as an incident by code that assumes
+       the enum holds.
+    2. **Entities are filled, not replaced.** A field ``classify`` already
+       determined wins; the model supplies only what was missing. Both
+       directions of that rule are fail-closed. A model cannot downgrade a
+       production reading to dev, and where it raises one — naming production
+       on a request that did not say — the result is more approval, not less.
+       Names outside the vocabularies above are dropped rather than stored, so
+       an invented service code cannot reach an asset lookup.
+    3. **Every derived field is recomputed here, in code.** ``category``,
+       ``priority``, ``missing_information`` and ``needs_approval`` come from
+       the same deterministic helpers ``classify`` uses, over the merged
+       entities. None of them is read from the model's answer. Approvals in
+       particular are ``or``-ed with the deterministic value, so this function
+       cannot be the reason a human is removed from a request.
+
+    ``confidence`` is the deterministic formula applied to the fuller entity
+    set, not the model's self-report — the claim is recorded by the caller in
+    the audit detail and is not allowed to stand in for a computed number.
+    """
+    if not outcome.ok:
+        return None
+    value = outcome.value or {}
+
+    intent = str(value.get("intent") or "").strip().upper()
+    if intent not in INTENTS:
+        return None
+
+    entities = dict(base.entities)
+    _fill_entity(entities, "service", value.get("service"), SERVICE_CODES)
+    _fill_entity(entities, "resource", value.get("resource"), RESOURCE_CODES)
+    _fill_entity(entities, "software", value.get("software"), SOFTWARE_CODES)
+    _fill_entity(entities, "environment", value.get("environment"), ENVIRONMENTS)
+
+    environment = entities.get("environment")
+    lowered = str(objective or "").lower()
+
+    if intent == "PERMISSION_REQUEST":
+        resource = entities.get("resource")
+        category = f"{resource}_PERMISSION" if resource else DEFAULT_PERMISSION_CATEGORY
+    elif intent == "SOFTWARE_REQUEST":
+        category = entities.get("software") or DEFAULT_SOFTWARE_CATEGORY
+    elif intent == "ASSET_REQUEST":
+        category = ASSET_CATEGORY
+    else:
+        category = entities.get("service") or DEFAULT_INCIDENT_CATEGORY
+
+    priority = _priority(intent, environment, entities, lowered)
+    if PRIORITIES.index(base.priority) > PRIORITIES.index(priority):
+        priority = base.priority
+    return TriageResult(
+        intent=intent,
+        category=category,
+        priority=priority,
+        entities=entities,
+        # Escalate-only, for the same reason the risk votes are: a model that
+        # reads the request as harmless must not be able to remove a gate the
+        # keyword rules already raised.
+        needs_approval=bool(base.needs_approval or _needs_approval(intent, environment, lowered)),
+        missing_information=_missing_information(intent, entities),
+        confidence=_confidence(intent_matched=True, entities=entities),
+        mode="llm_assisted",
+    )
+
+
+def _fill_entity(
+    entities: dict[str, Any], key: str, candidate: object, vocabulary: tuple[str, ...]
+) -> None:
+    """Set ``key`` from the model only when it is empty and the value is known.
+
+    The membership test is the point. ``category`` for an incident is the
+    service code and doubles as the ``assets.asset_type`` lookup key, so an
+    unchecked string here would travel from a language model to a database
+    query. An unknown name is dropped, which leaves the field missing — and a
+    missing field shows up in ``missing_information``, where a service desk can
+    see it, rather than silently becoming a lookup for something that is not
+    there.
+    """
+    if entities.get(key):
+        return
+    text = str(candidate or "").strip()
+    if not text:
+        return
+    upper = text.upper()
+    if upper in vocabulary:
+        entities[key] = upper
+    elif text in vocabulary:
+        entities[key] = text

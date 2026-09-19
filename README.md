@@ -126,11 +126,19 @@ memory_write → finalize → END
 
 ## 4. RAG 在哪里
 
-企业 RAG 是一个**正式注册的工具**（`query_enterprise_rag`，`app/services/tools/registry.py`），不是写死在提示词里的上下文：
+**先划清边界：本仓库没有 RAG。** 没有 embedding、没有向量库、没有 chunking、没有 reranker。
+本仓库有的是**一个到 RAG 服务的 HTTP 客户端**（`query_enterprise_rag`，
+`app/services/tools/registry.py` 里注册为工具），以及一套**确定性的子串检索**
+（`search_knowledge`）。两者是不同的东西，不要混着说。
 
-- 返回 ACL 过滤后的 chunk、citation、文档元数据；
+- **客户端转发身份**：把 `user_id` / `user_department` / `user_role` 放进请求体发给那个服务
+  （`tools/knowledge.py:97-115`）。**ACL 过滤发生在服务侧，不是本仓库实现的** ——
+  本仓库既不执行也不校验它，只是如实传递身份、不放大权限。
 - `KNOWLEDGE_RAG_BASE_URL` 未配置时优雅降级（`available: false`），不会伪造引用；
-- 本地制度检索走 `search_knowledge`，与远程 RAG 同一个证据通道。
+- **这条路径在本仓库里从未被验证过**：`AGENT_TOOL_MODE=mock` 是默认值，
+  且上面那个服务需要单独 clone 才存在。任何"RAG 返回了 X"的说法都不是本仓库能证明的。
+- 本地制度检索走 `search_knowledge`，与远程 RAG 是**两个独立证据通道**，
+  由 `RagResearchAgent` 与 `LocalPolicyResearchAgent` 分别产出。
 
 ---
 
@@ -197,13 +205,19 @@ memory_write → finalize → END
 
 IT 变更类工具：
 
-| 工具 | 类别 | `side_effect` | 角色 |
+| 工具 | 类别 | `side_effect` | 角色（最低门槛） |
 |---|---|---|---|
 | `diagnose_service` | `diagnostic_read` | 否 | `it_support` |
 | `flush_cache` | `cache_flush` | 是 | `it_support` |
 | `restart_service` | `service_restart` | 是 | `it_support` |
 | `grant_permission` | `permission_grant` | 是 | `it_support` |
 | `get_asset` / `get_user_assets` / `find_asset_by_type` | 只读资产查询 | 否 | `employee` |
+
+> 上表是 **registry 声明的最低门槛**，**不是**目标资产上的生效角色。
+> 变更类动作还会按目标资产的环境升级：**目标是 production 时要求 `it_admin`**
+> （`app/services/it/actions.py`，`production_requires_it_admin`），
+> `it_support` 会被拒绝。`flush_cache` / `restart_service` 在预发资产上仍是 `it_support`，
+> 在 production 资产上不是。
 
 ---
 
@@ -317,11 +331,17 @@ pip install -r requirements.txt
 
 Copy-Item .env.example .env
 .\.venv\Scripts\python.exe scripts\migrate.py --seed --demo-users   # 建库 + 种子数据 + 演示账号
-.\.venv\Scripts\python.exe scripts\preflight.py                     # 应输出 production_ready=true
+.\.venv\Scripts\python.exe scripts\preflight.py                     # 输出 production_ready=true
 uvicorn app.main:app --reload --port 8010
 ```
 
 打开：用户端 <http://127.0.0.1:8010> · API 文档 <http://127.0.0.1:8010/docs> · 管理端 <http://127.0.0.1:8010/admin>
+
+> **`production_ready=true` 在默认配置下不构成验证。** 它的定义是「没有阻断项」
+> （`production_ready = not blocking`），而绝大多数检查都被
+> `production_like = app_env in {staging, production}` 挡住；默认 `AGENT_ENV=development`，
+> 于是这些检查根本不执行，**SQLite 开发机上必然打印 true**。
+> 它有意义的前提是把 `AGENT_ENV` 设成 `staging`/`production`。
 
 > **务必使用项目 venv 的解释器。** 系统 `python` 通常没有 fastapi，直接跑会是一片 import 失败。
 
@@ -332,7 +352,9 @@ uvicorn app.main:app --reload --port 8010
 > *"Authentication is mandatory here regardless of `settings.auth_required`: the IT intake's
 > authorization model is entirely built on who is asking, so an anonymous submission has no meaning."*
 
-（7 个 IT 路由里只有 `GET /api/it/triage/preview` 是匿名的。）
+（8 个 IT 路由里有 2 个是匿名的：`GET /api/it/triage/preview` 与
+`GET /api/it/demo-scenarios` —— 后者只回静态元数据，且它列出的每个调用自己都要 token。
+其余 6 个全部强制认证。）
 所以先在 `/login` 登录，IT 面板才可用。演示账号（**仅本地演示**）：
 
 ```text
@@ -362,7 +384,16 @@ docker compose --env-file .env.hr-demo -f docker-compose.prod.yml up --build -d
 ```
 
 该 Compose 启动 Agent、Worker、Outbox dispatcher、Retention worker、一次性迁移任务、Redis、
-Agent PostgreSQL、RAG、pgvector、外部工单服务和本地 OIDC 提供方。
+Agent PostgreSQL、外部工单服务和本地 OIDC 提供方，**外加两个不属于本仓库的服务**：
+`rag-app` 与 `rag-postgres`。两者都来自上面 `git clone` 的
+[enterprise-knowledge-rag](https://github.com/smlfy/enterprise-knowledge-rag)
+（`build.context: ${RAG_BUILD_CONTEXT:-../enterprise-knowledge-rag}`），
+pgvector、embedding、rerank 全部由该服务的 `RAG_*` 变量配置。
+
+> **本仓库不提供向量检索能力。** 没有 embedding、没有向量库、没有 chunking、没有 reranker ——
+> `requirements.txt` 里也没有任何相关依赖。本仓库对 RAG 的全部贡献是一个 HTTP 客户端
+> （`app/services/tools/knowledge.py:query_enterprise_rag`），把问题与调用者身份发给那个服务。
+> 本仓库自己的知识检索是 `search_knowledge` 的**确定性子串匹配**，不是 RAG。
 
 外部工单 API 使用 `TICKET_SERVICE_TOKEN`；浏览器工单台用 `.env.hr-demo` 的
 `TICKET_DASHBOARD_USERNAME` / `TICKET_DASHBOARD_PASSWORD` 登录 <http://127.0.0.1:8020>。
@@ -471,7 +502,7 @@ Resolution → Risk Decision → Approval → Tool Execution → Final Ticket St
 | `POST /api/workflow/run` | 运行单 workflow |
 | `GET /api/approvals` | 查看待审批操作 |
 | `POST /api/approvals/{id}/decide` | 审批并恢复执行（字段是 **`approved`**） |
-| `GET /api/audit-logs` | 审计查询（过滤字段 **`event_type`**） |
+| `GET /api/audit-logs` | 审计查询（**只接受 `limit`**，服务端不支持 `event_type` 过滤 —— 见第 9 节） |
 | `GET /api/admin/audit/integrity` | 校验审计哈希链 |
 | `GET /api/eval-reports` | 查看评测报告 |
 | `GET/POST /api/customers` · `PATCH /api/customers/{id}` · `GET/POST /api/customers/{id}/interactions` | 多租户 CRM |
@@ -544,3 +575,30 @@ docker-compose.vllm.yml      可选 GPU 推理服务（overlay）
 - `.env` 已被 gitignore，**从未进入提交历史**；被跟踪的源码树中不含真实密钥。
 - 工具权限在 **Tool / Service 层**强制执行，不是靠提示词约束模型自觉。
 - 本项目使用 **Mock / Seed 数据**，未接入任何真实企业系统，**不是生产部署**。
+
+---
+
+## 19. Current Limitations
+
+下面是**当前版本的事实**，不是规划。每条都可在代码或报告里核对。
+
+**已实现并经过验证**（本机可复跑）：LangGraph 编排（21 节点）· Risk Gate（纯函数，R0–R7 级联）·
+Human Approval（`interrupt()` / `Command(resume=...)` 真中断）· Audit（哈希链 + 完整性校验）·
+Evaluation（21 例，跑真实链路）· IT 工单闭环 · 本地知识检索（`search_knowledge`，**确定性子串匹配**）·
+远程 RAG **客户端**（`query_enterprise_rag`）。
+
+**尚未真实验证**（代码在，但本机不具备条件）：
+
+- **真实 LLM provider** —— `AGENT_LLM_ENABLED` 默认 `false`。已验证的是假传输层下的工程化测试（25 例），
+  以及**恶意 stub provider** 下的完整评测（最坏模型下四项安全指标仍为 0 违规）。
+  桩只能证明「最坏情况下安全」，**不能**证明「真实模型下不退化」。
+- **真实 PostgreSQL** —— RLS 迁移（`TENANT_RLS_TABLES`，**17 张表**）代码在，本机无 PG。
+- **真实 Redis** —— `AGENT_QUEUE_BACKEND` 默认 `db`；Redis 非默认路径。
+- **Docker runtime** —— 3 个 compose 文件 YAML 合法，但**本机未安装 Docker，一个容器都没跑过**。
+  `docker_*_smoke_test.py` 是打已运行栈的集成脚本，不是自包含测试。
+- **真实外部 ITSM** —— `AGENT_TOOL_MODE` 默认 `mock`，无 ServiceNow / Jira 连接器。
+- **真实生产环境部署** —— 无并发 / QPS / SLA 数据。
+
+**关于 RAG**：本仓库**没有** embedding、向量库、chunking、reranker，`requirements.txt` 里也无相关依赖。
+向量检索属于同级仓库 [enterprise-knowledge-rag](https://github.com/smlfy/enterprise-knowledge-rag)，
+本仓库对它只有一个 HTTP 客户端，ACL 过滤在服务侧。**不要把本仓库描述成自己实现了完整 RAG。**
