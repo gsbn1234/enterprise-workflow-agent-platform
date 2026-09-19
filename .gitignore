@@ -1,4 +1,5 @@
 .venv/
+venv/
 __pycache__/
 **/__pycache__/
 *.pyc
@@ -11,4 +12,46 @@ data/
 .pytest_cache/
 *.log
 node_modules/
-frontend/dist/
+
+# SQLite scratch databases. ``data/`` is the conventional home for these, but a
+# database created anywhere else (a service directory, a repo-root probe) must
+# not become committable by accident -- these files hold audit trails, user
+# records and ticket content.
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# Claude Code's per-project state. ``.claude/settings.local.json`` holds local
+# permission grants and is machine-specific. It happens to be covered by a
+# global ignore on the machine this repo was developed on
+# (``~/.config/git/ignore``), but that file does not travel with the repository
+# -- on a collaborator's checkout or in CI it is absent, and this directory
+# would silently become committable. Ignore it here so the protection is part of
+# the repo rather than part of one developer's machine.
+.claude/
+
+# Working design document, deliberately not a repository deliverable. It is the
+# "二次开发方案" written against baseline b08da7f -- a planning artefact for the
+# Phase 1-4 build, not something the finished repo ships. Ignored rather than
+# merely left untracked so that a later ``git add -A`` cannot sweep it in by
+# accident: the decision not to publish it is enforced by the repo, not by
+# whoever happens to be typing the commit.
+analysis_plan.md
+
+# NOTE: ``app/static/react/`` is the Vite ``outDir`` (see vite.config.js) and its
+# build output IS committed -- that is how the container and a fresh checkout
+# serve the UI without running Node. Run ``npm run build`` and commit the
+# regenerated ``index.html`` together with the new hashed files under
+# ``app/static/react/assets/``; committing index.html alone points the page at
+# files that are not in the repository. The old ``frontend/dist/`` rule here was
+# dead -- Vite never wrote there.

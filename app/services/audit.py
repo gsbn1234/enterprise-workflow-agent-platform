@@ -91,6 +91,33 @@ def list_audit_logs(limit: int = 100, tenant_id: str | None = None) -> list[dict
     return [hydrate_audit_log(item) for item in rows_to_dicts(rows)]
 
 
+def list_it_audit_chain(ticket_id: str, tenant_id: str | None = None) -> list[dict]:
+    """Every ``it.*`` audit row recorded against one ticket, oldest first.
+
+    Ordered by ``rowid`` rather than ``created_at``: ``audit_logs.id`` is random
+    hex and ``created_at`` resolves only to the microsecond, so two events
+    written back to back can land on the same timestamp and a sort on it would
+    be free to swap them. Insertion order is the only ordering actually
+    guaranteed, and it is what makes the result read as the reasoning sequence
+    the chain view presents it as.
+
+    The ``it.*`` filter is what keeps this about the IT loop: the ``ticket.*``
+    lifecycle rows interleaved with them are the generic ticketing trail and are
+    returned separately by ``list_ticket_events``.
+    """
+    clauses = ["target_type = 'ticket'", "target_id = ?", "event_type LIKE 'it.%'"]
+    params: list[Any] = [ticket_id]
+    if tenant_id:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM audit_logs WHERE {' AND '.join(clauses)} ORDER BY rowid ASC",
+            params,
+        ).fetchall()
+    return [hydrate_audit_log(item) for item in rows_to_dicts(rows)]
+
+
 def verify_audit_log_integrity(limit: int | None = None) -> dict:
     sql_limit = "" if limit is None else "LIMIT ?"
     params: tuple[Any, ...] = () if limit is None else (max(1, min(limit, 10000)),)

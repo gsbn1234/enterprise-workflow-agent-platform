@@ -6,9 +6,12 @@ import logging
 from app.config import settings
 from app.services.agent.executor import get_run_detail, run_workflow
 from app.services.agent.planner import plan_workflow
+from app.services.it.risk_gate import ACTION_CLASSES
+from app.services.it.triage import CRITICAL_SERVICES
 from app.services.llm import LLMError, complete_json, llm_ready
 from app.services.multi_agent.memory import add_memory, search_similar_memories
 from app.services.tools.knowledge import query_enterprise_rag, search_knowledge
+from app.services.tools.registry import call_tool
 
 
 logger = logging.getLogger("agent_platform.multi_agent")
@@ -20,6 +23,18 @@ SIDE_EFFECT_TOOLS = {
     "notify_internal_team",
     "request_approval",
 }
+
+# --- IT resolution -----------------------------------------------------------
+# A resolution with no retrieved evidence is not a plan, it is a guess, so one
+# quotable evidence item is the floor for proposing anything at all.
+MIN_EVIDENCE_ITEMS = 1
+
+RESTART_KEYWORDS: tuple[str, ...] = ("重启", "restart", "恢复", "重新启动", "reboot")
+CACHE_KEYWORDS: tuple[str, ...] = ("缓存", "cache", "flush", "清理")
+
+# Fallback when neither the request nor the evidence points at an action:
+# read-only diagnostics, which cannot make anything worse.
+INCIDENT_DEFAULT_ACTION = "diagnostic_read"
 
 
 class SupervisorAgent:
@@ -154,6 +169,31 @@ class LocalPolicyResearchAgent:
         return search_knowledge(objective, limit=3)
 
 
+class HistoricalTicketResearchAgent:
+    """Retrieve how comparable incidents were handled in the past.
+
+    This is the second evidence channel and it stays strictly second. What comes
+    back is a record of what somebody once did, not an approved procedure, so the
+    caller stores it under ``historical_*`` keys that the resolution agent reads
+    for reporting and never for choosing an action.
+
+    Unlike its two siblings above it reaches the corpus through ``call_tool``
+    rather than importing the function. That costs one role-gate lookup and buys
+    two things the direct import cannot: the retrieval appears as an
+    ``mcp.tool_call`` row like every other tool invocation, and there is no way
+    to read the corpus that bypasses the registry.
+    """
+
+    name = "historical_ticket_research"
+
+    def run(self, objective: str, *, tenant_id: str | None = None, limit: int = 3) -> dict:
+        return call_tool(
+            "search_historical_tickets",
+            {"query": objective, "limit": limit, "tenant_id": tenant_id},
+            source="multi_agent_it",
+        )
+
+
 class RagResearchAgent:
     name = "rag_research"
 
@@ -223,6 +263,364 @@ class RagResearchAgent:
                 "reuse_without_retrieval": True,
             },
         }
+
+
+class ResolutionAgent:
+    """Turn evidence + triage + ticket context into one proposed IT action.
+
+    This agent **proposes and never executes**. It returns a structured
+    resolution; whether anything runs is decided afterwards by the
+    deterministic risk gate and, when the gate asks for one, a human. Nothing
+    in this class calls a mutating tool.
+
+    Two rules shape the design:
+
+    * **No evidence, no answer.** If retrieval came back empty the agent
+      returns ``NO_KNOWLEDGE`` with ``diagnosis: None`` rather than letting a
+      model improvise a plausible-sounding fix. The check is deterministic and
+      runs before any LLM call, so it cannot be talked out of.
+    * **The LLM may phrase, never decide.** The action type, target and
+      arguments are derived by the code below. An LLM is at most allowed to
+      reword the diagnosis, and its ``action_type`` is discarded outright.
+      The same discipline as ``_apply_expert_risk_suggestion``, which can only
+      escalate risk and never remove an approval.
+
+    ``confidence`` is reported for the audit trail and is never read by the
+    risk gate.
+
+    Two evidence channels arrive here and they are not equals. ``research_output``
+    is formal knowledge — approved policy and runbooks — and it alone decides
+    whether an action may be proposed and which one. ``historical_output`` is
+    what happened on comparable tickets before, and it is reported under its own
+    ``historical_*`` keys without ever reaching ``_select_action``: a historical
+    ticket naming a class the gate denies cannot move the selected action, and
+    that is a property of the code (`evidence` is built from one input only)
+    rather than a promise made in a prompt.
+    """
+
+    name = "resolution"
+
+    def run(
+        self,
+        objective: str,
+        *,
+        triage: dict | None = None,
+        research_output: dict | None = None,
+        ticket: dict | None = None,
+        historical_output: dict | None = None,
+    ) -> dict:
+        triage = triage or {}
+        research_output = research_output or {}
+        ticket = ticket or {}
+        entities = dict(triage.get("entities") or {})
+        environment = _first_text(ticket.get("environment"), entities.get("environment"))
+        # Knowledge only. The historical channel is read below and deliberately
+        # never enters this variable — this line is the whole separation.
+        evidence = _resolution_evidence(research_output)
+        historical = _historical_evidence(historical_output)
+        missing_information = [str(item) for item in (triage.get("missing_information") or [])]
+
+        if not _sufficient_evidence(research_output, evidence):
+            return self._no_knowledge(
+                triage, research_output, environment, missing_information, historical
+            )
+
+        intent = str(triage.get("intent") or "IT_INCIDENT")
+        action_type, reason = _select_action(objective, intent, entities, environment, evidence)
+        action_class = ACTION_CLASSES[action_type]
+        arguments = _action_arguments(action_type, ticket, entities, triage)
+        target = _first_text(ticket.get("asset_id"), entities.get("resource"), entities.get("service"))
+
+        confidence = _resolution_confidence(evidence)
+        resolution = {
+            "status": "PROPOSED",
+            "diagnosis": _diagnosis(evidence),
+            "evidence": evidence[:3],
+            "evidence_count": len(evidence),
+            "proposed_action": action_class.tool_name,
+            "action_type": action_type,
+            "action_arguments": arguments,
+            "target": target,
+            "environment": environment,
+            "confidence": confidence,
+            # The agent's opinion, recorded for the audit trail. The gate below
+            # is what actually decides; see app.services.it.risk_gate.
+            "requires_approval": bool(
+                triage.get("needs_approval") or action_class.requires_approval
+            ),
+            "missing_information": missing_information,
+            "reason": reason,
+            "mode": "deterministic",
+            "producer": self.name,
+            "handoff_contract": {
+                "consumer": "risk_gate",
+                "fields": ["action_type", "action_arguments", "target", "environment", "evidence"],
+                "advisory_only": ["confidence", "requires_approval"],
+            },
+            # Reference material, reported beside the evidence and consumed by
+            # nothing downstream. ``historical_reference`` is false here on
+            # purpose: the action was decided from knowledge, so the history is
+            # illustrating the answer rather than standing in for one.
+            **_historical_block(historical, referenced=False, chosen_action=action_type),
+        }
+        polished = self._polish_diagnosis(objective, resolution)
+        if polished:
+            resolution["diagnosis"] = polished
+            resolution["mode"] = "llm_augmented"
+        return resolution
+
+    def _no_knowledge(
+        self,
+        triage: dict,
+        research_output: dict,
+        environment: str | None,
+        missing_information: list[str],
+        historical: list[dict] | None = None,
+    ) -> dict:
+        """Nothing formal was retrieved, so nothing is proposed — ever.
+
+        Historical tickets do not change that. When some were found they are
+        attached with ``historical_reference`` set, which is the flag that says
+        "a human may find this useful" and simultaneously that it is *not* a
+        policy basis: the status stays ``NO_KNOWLEDGE``, the diagnosis stays
+        ``None`` and the action stays ``no_action``. The gate then refuses to run
+        anything, so a missing runbook cannot be papered over by a past
+        workaround, however similar it looks.
+        """
+        historical = historical or []
+        return {
+            "status": "NO_KNOWLEDGE",
+            "diagnosis": None,
+            "evidence": [],
+            "evidence_count": int(research_output.get("evidence_count") or 0),
+            "proposed_action": None,
+            "action_type": "no_action",
+            "action_arguments": {},
+            "target": None,
+            "environment": environment,
+            "confidence": 0.0,
+            "requires_approval": True,
+            "missing_information": missing_information,
+            "route": "request_more_information" if missing_information else "human_handoff",
+            "reason": "no_knowledge_evidence",
+            "mode": "deterministic_no_knowledge",
+            "warnings": list(research_output.get("warnings") or []),
+            "producer": self.name,
+            **_historical_block(historical, referenced=bool(historical), chosen_action=None),
+        }
+
+    def _polish_diagnosis(self, objective: str, resolution: dict) -> str | None:
+        """Optional rewording of the diagnosis. Cannot change what will run."""
+        payload = _expert_json(
+            self.name,
+            (
+                "You are an enterprise IT resolution agent. Rewrite the supplied diagnosis in one or two "
+                "operational sentences using only the evidence given. Return JSON with a single field "
+                "`diagnosis`. Do not propose a different action, do not add facts that are not in the "
+                "evidence, and do not speculate about causes the evidence does not mention."
+            ),
+            {
+                "objective": objective,
+                "deterministic_diagnosis": resolution["diagnosis"],
+                "action_type": resolution["action_type"],
+                "evidence": resolution["evidence"],
+            },
+        )
+        text = str((payload or {}).get("diagnosis") or "").strip()
+        return text or None
+
+
+def _resolution_evidence(research_output: dict) -> list[dict]:
+    """Keep only evidence items that actually carry a quotable snippet."""
+    evidence: list[dict] = []
+    for item in research_output.get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        snippet = str(item.get("snippet") or "").strip()
+        if not snippet:
+            continue
+        evidence.append(
+            {
+                "source": str(item.get("source") or "unknown"),
+                "title": str(item.get("title") or "Policy evidence"),
+                "snippet": snippet,
+                "score": item.get("score"),
+                "article_id": item.get("article_id"),
+                "document_id": item.get("document_id"),
+                "chunk_id": item.get("chunk_id"),
+            }
+        )
+    return evidence
+
+
+def _sufficient_evidence(research_output: dict, evidence: list[dict]) -> bool:
+    """Whether retrieval produced enough to justify proposing an action.
+
+    Both signals are produced by ``RagResearchAgent`` already; nothing new is
+    invented here. ``no_relevant_policy_evidence`` is set when the merged
+    channels came back empty, and ``evidence_count`` is the merged length.
+    """
+    if len(evidence) < MIN_EVIDENCE_ITEMS:
+        return False
+    if "no_relevant_policy_evidence" in (research_output.get("warnings") or []):
+        return False
+    return int(research_output.get("evidence_count") or 0) >= MIN_EVIDENCE_ITEMS
+
+
+def _historical_evidence(historical_output: dict) -> list[dict]:
+    """Normalise the historical channel's results into evidence-shaped items.
+
+    Shaped like ``_resolution_evidence`` so a reader can compare the two lists
+    side by side, but deliberately *not* merged into it and never returned under
+    ``evidence``. The ``source`` is the historical index rather than an article
+    source, which is what makes the two channels tellable apart downstream.
+    """
+    evidence: list[dict] = []
+    for item in (historical_output or {}).get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        ticket_id = str(item.get("ticket_id") or "").strip()
+        snippet = str(item.get("resolution") or "").strip()
+        if not ticket_id or not snippet:
+            continue
+        evidence.append(
+            {
+                "source": str(item.get("source") or "historical_ticket_index"),
+                "ticket_id": ticket_id,
+                "title": str(item.get("title") or "Historical ticket"),
+                "snippet": snippet,
+                "resolution_action": _first_text(item.get("resolution_action")),
+                "category": _first_text(item.get("category")),
+                "environment": _first_text(item.get("environment")),
+                "status": _first_text(item.get("status")),
+                "score": item.get("score"),
+                "similarity": item.get("similarity"),
+            }
+        )
+    return evidence
+
+
+def _historical_block(
+    historical: list[dict], *, referenced: bool, chosen_action: str | None
+) -> dict:
+    """The four ``historical_*`` keys, built in one place for both exit paths.
+
+    ``referenced`` is the §七 flag and it is the caller's to set, because only
+    the caller knows which of the two exits it is on: it means "the history is
+    standing in for the missing policy", which is true exactly when knowledge
+    was insufficient. ``historical_count`` is reported either way, so "we looked
+    at history and it agreed" stays distinguishable from "we never looked".
+
+    ``historical_divergence`` compares the *top-ranked* past handling against the
+    action this run chose. Comparing against every retrieved ticket instead
+    would set the flag on nearly every multi-result query — three precedents
+    rarely agree — and a warning that is always on carries no information. When
+    the best match records no action, the next-ranked one that does is used.
+    """
+    precedent = next(
+        (item for item in historical if item.get("resolution_action")), None
+    )
+    divergence = bool(
+        chosen_action
+        and precedent
+        and precedent["resolution_action"] != chosen_action
+    )
+    if referenced:
+        note = (
+            "历史工单仅供参考，不是正式政策，不能作为执行依据；"
+            "缺少可用知识，本单需人工处理。"
+        )
+    elif historical:
+        note = "历史工单仅供参考，不作为政策依据；本次动作由正式知识决定。"
+    else:
+        note = "未检索到相似历史工单；本次动作由正式知识决定。"
+    return {
+        "historical_evidence": historical,
+        "historical_count": len(historical),
+        "historical_reference": bool(referenced),
+        "historical_divergence": divergence,
+        "historical_note": note,
+    }
+
+
+def _select_action(
+    objective: str, intent: str, entities: dict, environment: str | None, evidence: list[dict]
+) -> tuple[str, str]:
+    """Deterministic action selection. The ordering is the specification.
+
+    An explicit cue in the request beats an inference; an inference beats a
+    guess; and when nothing points anywhere the fallback is read-only
+    diagnostics, which is always safe to run and never over-reaches.
+    """
+    if intent == "PERMISSION_REQUEST":
+        return "permission_grant", "intent_permission_request"
+    if intent in {"ASSET_REQUEST", "SOFTWARE_REQUEST"}:
+        return "no_action", f"intent_{intent.lower()}_routed_to_team"
+
+    lowered = str(objective or "").lower()
+    if _contains_any(lowered, RESTART_KEYWORDS):
+        return "service_restart", "request_reports_service_down"
+    if _contains_any(lowered, CACHE_KEYWORDS):
+        return "cache_flush", "request_reports_cache_pressure"
+
+    service = str(entities.get("service") or "").upper()
+    if environment == "production" and service in CRITICAL_SERVICES:
+        return "service_restart", f"production_incident_on_critical_service:{service.lower()}"
+
+    evidence_text = " ".join(str(item.get("snippet") or "") for item in evidence).lower()
+    if _contains_any(evidence_text, RESTART_KEYWORDS):
+        return "service_restart", "evidence_recommends_restart"
+    if _contains_any(evidence_text, CACHE_KEYWORDS):
+        return "cache_flush", "evidence_recommends_cache_flush"
+
+    return INCIDENT_DEFAULT_ACTION, "no_actionable_evidence_defaulting_to_read_only"
+
+
+def _action_arguments(action_type: str, ticket: dict, entities: dict, triage: dict) -> dict:
+    """Build the tool kwargs for the selected action.
+
+    The tool is not called here; these arguments are handed to the risk gate
+    and, if it clears them, to ``call_tool``.
+    """
+    asset_id = _first_text(ticket.get("asset_id"))
+    if action_type == "permission_grant":
+        return {
+            "employee_id": _first_text(ticket.get("requester_user_id")),
+            "resource": _first_text(entities.get("resource"), entities.get("service"), "GENERAL"),
+            "access_level": _first_text(entities.get("access_level"), "read_only"),
+        }
+    if action_type == "no_action":
+        return {}
+    return {"asset_id": asset_id}
+
+
+def _diagnosis(evidence: list[dict]) -> str:
+    """Compose the diagnosis from the retrieved evidence, quoting it directly.
+
+    Deliberately a quotation rather than a paraphrase: a reader can check it
+    against the cited article, and the agent cannot assert anything the
+    evidence did not say.
+    """
+    primary = evidence[0]
+    snippet = str(primary.get("snippet") or "").strip()
+    return f"依据《{primary.get('title')}》（来源：{primary.get('source')}）：{snippet[:200]}"
+
+
+def _resolution_confidence(evidence: list[dict]) -> float:
+    """Evidence-strength score, reported for audit only. Never read by the gate."""
+    return round(min(0.95, 0.5 + 0.1 * len(evidence)), 2)
+
+
+def _first_text(*values) -> str | None:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _contains_any(lowered: str, keywords: tuple[str, ...]) -> bool:
+    return any(keyword in lowered for keyword in keywords)
 
 
 class ComplianceRiskAgent:
@@ -390,6 +788,7 @@ class ToolExecutionAgent:
         supervisor_output: dict | None = None,
         research_output: dict | None = None,
         risk_output: dict | None = None,
+        it_action: dict | None = None,
     ) -> dict:
         workflow = run_workflow(
             objective,
@@ -400,6 +799,7 @@ class ToolExecutionAgent:
             plan_override=(supervisor_output or {}).get("plan"),
             knowledge_override=research_output,
             risk_override=risk_output,
+            it_action=it_action,
         )
         approval_steps = [
             step for step in workflow.get("steps", []) if step.get("tool_name") == "request_approval"
@@ -446,7 +846,14 @@ class ToolExecutionAgent:
 class CriticAgent:
     name = "critic"
 
-    def run(self, workflow_run_id: str, supervisor_output: dict, risk_output: dict | None) -> dict:
+    def run(
+        self,
+        workflow_run_id: str,
+        supervisor_output: dict,
+        risk_output: dict | None,
+        *,
+        it_context: dict | None = None,
+    ) -> dict:
         workflow = get_run_detail(workflow_run_id)
         steps = workflow.get("steps", []) if workflow else []
         tools = [step.get("tool_name") for step in steps if step.get("tool_name")]
@@ -468,11 +875,22 @@ class CriticAgent:
                 findings.append({"severity": "high", "code": "missing_ticket_update", "message": "Ticket update tool was not called."})
                 score -= 25
         else:
-            if "query_enterprise_rag" not in tools:
+            # An IT run retrieves evidence in the graph's own research nodes, so
+            # ``query_enterprise_rag`` can never appear among this workflow's
+            # steps and the check below would dock 25 points from every correct
+            # IT run — enough to fail the gate outright. Whether the evidence was
+            # actually consumed is still checked, via the research handoff below.
+            if it_context is None and "query_enterprise_rag" not in tools:
                 findings.append({"severity": "high", "code": "missing_rag_tool", "message": "RAG tool was not called."})
                 score -= 25
             waiting_for_approval = bool(supervisor_output["plan"].get("needs_approval")) and workflow.get("status") == "waiting_approval"
-            if "create_ticket" not in tools and not waiting_for_approval and not approval_denied:
+            if it_context is not None:
+                # An IT run works on the ticket the intake path already created,
+                # so "no ticket was created" is the expected shape rather than a
+                # defect. What is worth checking instead is whether the run did
+                # what the deterministic gate decided — see _it_critic_penalty.
+                score -= _it_critic_penalty(findings, it_context, tools, waiting_for_approval)
+            elif "create_ticket" not in tools and not waiting_for_approval and not approval_denied:
                 findings.append({"severity": "high", "code": "missing_ticket", "message": "No operational ticket was created."})
                 score -= 25
         if supervisor_output["plan"]["needs_approval"] and workflow.get("status") not in {"waiting_approval", "completed", "cancelled"}:
@@ -599,6 +1017,61 @@ class CriticAgent:
             "safe_to_retry": not successful_side_effect_tools,
             "reasoning_mode": "llm_augmented" if llm_review else "deterministic_quality_gate",
         }
+
+
+def _it_critic_penalty(
+    findings: list[dict], it_context: dict, tools: list, waiting_for_approval: bool
+) -> int:
+    """Quality checks specific to an IT run. Appends findings, returns the penalty.
+
+    These replace the ``create_ticket`` check rather than adding to it, and each
+    one states a way the risk gate could have been bypassed — which is the only
+    failure that really matters here. The gate's own decision is the reference
+    point: a run that reached a different outcome than the gate decided is
+    defective no matter how it looks step by step.
+    """
+    penalty = 0
+    decision = it_context.get("decision")
+    tool_name = it_context.get("tool_name")
+    executed = bool(it_context.get("executed"))
+
+    if "update_ticket" not in tools:
+        findings.append(
+            {
+                "severity": "high",
+                "code": "missing_ticket_update",
+                "message": "The IT ticket was never updated with the outcome of the run.",
+            }
+        )
+        penalty += 25
+    if decision == "require_approval" and "request_approval" not in tools:
+        findings.append(
+            {
+                "severity": "high",
+                "code": "it_gate_bypassed",
+                "message": "The risk gate required human approval but no approval was requested.",
+            }
+        )
+        penalty += 40
+    if decision == "auto_execute" and tool_name not in tools and not executed and not waiting_for_approval:
+        findings.append(
+            {
+                "severity": "critical",
+                "code": "it_action_missing",
+                "message": "The risk gate cleared an automatic action but the action never ran.",
+            }
+        )
+        penalty += 40
+    if decision == "deny" and executed:
+        findings.append(
+            {
+                "severity": "critical",
+                "code": "it_denied_action_executed",
+                "message": "An action the risk gate denied was executed anyway.",
+            }
+        )
+        penalty += 40
+    return penalty
 
 
 class CorrectionAgent:

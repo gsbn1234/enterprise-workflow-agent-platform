@@ -2,6 +2,15 @@
 
 这份文档记录如何用 Docker Compose 启动当前 Agent 平台。
 
+仓库里有两个 compose 文件：
+
+```text
+docker-compose.yml        本地开发栈（SQLite + DB 队列，两个容器）
+docker-compose.prod.yml   HR/生产化 Demo（PostgreSQL + Redis + RAG + 外部工单 + 本地 OIDC，11 个服务）
+```
+
+第 1-5 节走 `docker-compose.yml`；完整 HR Demo 走第 6 节。
+
 ## 1. 构建并启动
 
 默认映射到宿主机 `8010`：
@@ -71,11 +80,13 @@ docker compose logs -f workflow-agent
 docker compose logs -f workflow-worker
 ```
 
-容器内置健康检查，会请求：
+容器内置健康检查，开发 compose 与生产 compose 的 `workflow-agent` 都会请求：
 
 ```text
-GET /api/health
+GET /api/readiness
 ```
+
+`/api/readiness` 会同时校验数据库状态，所以容器只有在数据库可用后才会变成 `healthy`。`GET /api/health` 仍然提供，作为不检查依赖的轻量存活端点。
 
 ## 3. 运行 Docker 版烟测
 
@@ -99,7 +110,7 @@ python scripts\docker_smoke_test.py --base-url http://127.0.0.1:8011 --user-id a
 
 烟测会：
 
-- 等待 `/api/health` 正常
+- 等待 `/api/readiness` 正常（服务本身与数据库都 ready）
 - 发起一个退款类业务 workflow
 - 验证分类为 `refund`
 - 验证高风险请求停在 `waiting_approval`
@@ -141,7 +152,7 @@ Remove-Item -Recurse -Force .\data
 docker compose logs -f workflow-worker
 ```
 
-Worker 启动后会持续轮询：
+Worker 启动后会持续轮询。开发 compose 没有设置 `AGENT_QUEUE_BACKEND`，默认是 `db`：
 
 ```text
 workflow_jobs.status = queued
@@ -153,9 +164,11 @@ workflow_jobs.status = queued
 queued -> running -> completed / failed
 ```
 
+生产 compose 设置 `AGENT_QUEUE_BACKEND=redis`，worker 改为先阻塞等待 Redis 队列里的 job id 信号，再回到数据库原子领取对应行；数据库仍然是唯一的状态机（见 `docs/QUEUEING.md`）。
+
 ## 6. PostgreSQL 版 HR/生产化 Demo
 
-完整版 HR Demo 会同时启动 Agent、Agent Worker、Agent PostgreSQL、RAG、pgvector 和外部工单系统：
+完整版 HR Demo 会启动 11 个服务：Agent、Agent Worker、outbox 派发器、数据保留清理 worker、一次性迁移、Agent PostgreSQL、Redis、RAG、pgvector 库、外部工单系统和本地 OIDC Provider：
 
 ```powershell
 Copy-Item .env.hr-demo.example .env.hr-demo
@@ -181,7 +194,7 @@ docker compose --env-file .env.hr-demo -f docker-compose.prod.yml up -d agent-po
 
 ## 7. 当前 Docker 形态
 
-当前 compose 包含两个应用容器：
+`docker-compose.yml`（本地开发）只有两个容器：
 
 ```text
 workflow-agent    FastAPI Web 服务
@@ -194,10 +207,47 @@ workflow-worker   后台任务 worker，领取并执行 workflow_jobs
 ./data:/app/data
 ```
 
-当前队列是 DB-backed queue，适合本地演示和作品集验收。生产化下一步建议：
+`docker-compose.prod.yml`（HR/生产化 Demo）共 11 个服务：
 
-- PostgreSQL 替代 SQLite
-- Redis + Celery/RQ 执行长任务
-- 官方 MCP SDK 版本
-- API 鉴权和角色权限
-- OpenTelemetry / LangSmith / Langfuse
+```text
+workflow-agent               FastAPI Web 服务，映射 8010
+workflow-worker              异步 job worker，监听 Redis 队列
+workflow-outbox-dispatcher   外发 outbox 派发（scripts/outbox_dispatcher.py）
+workflow-retention-worker    按保留策略定期清理数据（scripts/retention_worker.py）
+workflow-migrate             一次性迁移 + seed（--seed --demo-users，restart: "no"）
+agent-postgres               Agent 主库 PostgreSQL 16，映射 5433
+agent-redis                  Redis 7 队列，映射 6379
+rag-postgres                 pgvector/pgvector:pg16，映射 5432
+rag-app                      RAG 知识库服务，映射 8000
+external-ticket-service      模拟外部工单系统，映射 8020
+local-oidc-provider          本地 OIDC Provider，映射 8030
+```
+
+依赖顺序由 healthcheck 串起来：`workflow-migrate` 在 `agent-postgres`、`agent-redis` 健康后跑完并成功退出，`workflow-agent` 才启动；`workflow-worker`、`workflow-outbox-dispatcher`、`workflow-retention-worker` 都等 `workflow-agent` 健康后再起。
+
+生产 compose 使用命名卷而不是宿主机目录：
+
+```text
+agent_postgres_data / agent_redis_data / agent_data / ticket_service_data / rag_app_data / rag_postgres_data
+```
+
+当前队列有两种后端（`app/services/queue.py`，配置见 `docs/QUEUEING.md`）：
+
+```text
+AGENT_QUEUE_BACKEND=db      本地默认，worker 轮询 workflow_jobs 表
+AGENT_QUEUE_BACKEND=redis   生产 compose 默认，Redis 只承载 job id 信号，数据库仍是 source of truth
+```
+
+这些能力已经实现，不再属于"下一步"：
+
+- PostgreSQL 主库：`AGENT_DB_BACKEND=postgres`，schema 迁移由 `scripts/migrate.py` + `schema_migrations` 表管理（未使用 Alembic），多租户行级安全见 `AGENT_POSTGRES_RLS_ENABLED`
+- Redis 队列：`AGENT_QUEUE_BACKEND=redis`、`AGENT_REDIS_URL`、`AGENT_REDIS_QUEUE_NAME`
+- API 鉴权和角色权限：本地账号 + OIDC 浏览器登录 + SCIM 用户同步（`local-oidc-provider`），工具级 `required_role` 校验
+- 多租户隔离：`AGENT_TENANT_ISOLATION_ENABLED`、`AGENT_DEFAULT_TENANT_ID`
+- OpenTelemetry：`AGENT_OTEL_ENABLED`、`OTEL_EXPORTER_OTLP_ENDPOINT`（`app/services/observability.py`，烟测 `scripts/observability_smoke_test.py`）
+
+仍然属于后续工作：
+
+- 官方 MCP SDK 版本（当前是 MCP-style JSON-RPC 实现）
+- Celery/RQ 这类成熟任务框架（当前 Redis 队列直接由 `app/services/queue.py` 实现）
+- LangSmith / Langfuse（OTel 之外的 LLM 可观测平台）

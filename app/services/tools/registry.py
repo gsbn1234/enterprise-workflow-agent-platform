@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import inspect
 import time
 from typing import Any, Callable
 
 from app.services.audit import record_audit
+from app.services.it.actions import diagnose_service, flush_cache, grant_permission, restart_service
+from app.services.it.history import search_historical_tickets
+from app.services.it.rbac import authorize_tool_call, denied_payload
+from app.services.it.tools import find_asset_by_type, get_asset, get_department, get_employee, get_user_assets
 from app.services.tools.approvals import create_approval
 from app.services.tools.crm import lookup_customer
 from app.services.tools.email import draft_email
@@ -37,6 +42,7 @@ def request_approval(
 TOOL_REGISTRY: dict[str, ToolFn] = {
     "query_enterprise_rag": query_enterprise_rag,
     "search_knowledge": search_knowledge,
+    "search_historical_tickets": search_historical_tickets,
     "lookup_customer": lookup_customer,
     "create_ticket": create_ticket,
     "query_tickets": query_tickets,
@@ -44,6 +50,15 @@ TOOL_REGISTRY: dict[str, ToolFn] = {
     "draft_email": draft_email,
     "notify_internal_team": notify_internal_team,
     "request_approval": request_approval,
+    "get_employee": get_employee,
+    "get_department": get_department,
+    "get_user_assets": get_user_assets,
+    "get_asset": get_asset,
+    "find_asset_by_type": find_asset_by_type,
+    "diagnose_service": diagnose_service,
+    "flush_cache": flush_cache,
+    "restart_service": restart_service,
+    "grant_permission": grant_permission,
 }
 
 
@@ -85,6 +100,33 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "required": ["query"],
         },
         "output_shape": {"results": "array", "source": "string"},
+        "side_effect": False,
+        "requires_approval": False,
+        "required_role": "employee",
+    },
+    {
+        "name": "search_historical_tickets",
+        "description": (
+            "Search past IT tickets for how similar incidents were handled. Reference material only: "
+            "it is not policy and must never be treated as one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
+                "ticket_id": {"type": ["string", "null"]},
+                "category": {"type": ["string", "null"]},
+                "tenant_id": {"type": ["string", "null"]},
+            },
+            "required": ["query"],
+        },
+        "output_shape": {
+            "results": "array",
+            "count": "integer",
+            "source": "string",
+            "available": "boolean",
+        },
         "side_effect": False,
         "requires_approval": False,
         "required_role": "employee",
@@ -236,6 +278,145 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "requires_approval": False,
         "required_role": "manager",
     },
+    {
+        "name": "get_employee",
+        "description": "Read an IT directory employee profile. Reading another employee's profile requires it_support or above.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"employee_id": {"type": "string", "minLength": 1}},
+            "required": ["employee_id"],
+        },
+        "output_shape": {"found": "boolean", "employee": "object|null", "reason": "string|null"},
+        "side_effect": False,
+        "requires_approval": False,
+        "required_role": "employee",
+        "require_auth_context": True,
+    },
+    {
+        "name": "get_department",
+        "description": "Read an IT directory department with its head and active headcount.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"department_id": {"type": "string", "minLength": 1}},
+            "required": ["department_id"],
+        },
+        "output_shape": {"found": "boolean", "department": "object|null", "reason": "string|null"},
+        "side_effect": False,
+        "requires_approval": False,
+        "required_role": "employee",
+        "require_auth_context": True,
+    },
+    {
+        "name": "get_user_assets",
+        "description": "List the assets owned by a user, defaulting to the caller. Listing another user's assets requires it_support or above.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"user_id": {"type": ["string", "null"]}},
+        },
+        "output_shape": {"user_id": "string", "count": "integer", "assets": "array"},
+        "side_effect": False,
+        "requires_approval": False,
+        "required_role": "employee",
+        "require_auth_context": True,
+    },
+    {
+        "name": "get_asset",
+        "description": "Read an IT asset by id. Production assets are redacted for callers below it_support.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"asset_id": {"type": "string", "minLength": 1}},
+            "required": ["asset_id"],
+        },
+        "output_shape": {"found": "boolean", "asset": "object|null", "reason": "string|null"},
+        "side_effect": False,
+        "requires_approval": False,
+        "required_role": "employee",
+        "require_auth_context": True,
+    },
+    {
+        "name": "find_asset_by_type",
+        "description": "Resolve an asset type such as redis or vpn to a single asset. Reports ambiguity instead of guessing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"asset_type": {"type": "string", "minLength": 1}},
+            "required": ["asset_type"],
+        },
+        "output_shape": {"found": "boolean", "asset": "object|null", "reason": "string|null"},
+        "side_effect": False,
+        "requires_approval": False,
+        "required_role": "employee",
+        "require_auth_context": True,
+    },
+    {
+        "name": "diagnose_service",
+        "description": "Run read-only diagnostics against an IT asset. The only IT action that is automatic in production.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "string", "minLength": 1},
+                "ticket_id": {"type": ["string", "null"]},
+            },
+            "required": ["asset_id"],
+        },
+        "output_shape": {"found": "boolean", "asset_id": "string", "environment": "string", "checks": "array"},
+        "side_effect": False,
+        "requires_approval": False,
+        "required_role": "it_support",
+        "require_auth_context": True,
+    },
+    {
+        "name": "flush_cache",
+        "description": "Evict the cache on an IT asset. Reversible; production requires it_admin.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "string", "minLength": 1},
+                "ticket_id": {"type": ["string", "null"]},
+            },
+            "required": ["asset_id"],
+        },
+        "output_shape": {"executed": "boolean", "asset_id": "string", "keys_evicted": "integer"},
+        "side_effect": True,
+        "requires_approval": False,
+        "required_role": "it_support",
+        "require_auth_context": True,
+    },
+    {
+        "name": "restart_service",
+        "description": "Restart the service on an IT asset. Always requires human approval; production requires it_admin.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "string", "minLength": 1},
+                "ticket_id": {"type": ["string", "null"]},
+            },
+            "required": ["asset_id"],
+        },
+        "output_shape": {"executed": "boolean", "asset_id": "string", "downtime_seconds": "integer", "health": "string"},
+        "side_effect": True,
+        "requires_approval": True,
+        "required_role": "it_support",
+        "require_auth_context": True,
+    },
+    {
+        "name": "grant_permission",
+        "description": "Grant an employee access to a resource. Always requires human approval; read-write or production requires it_admin.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "employee_id": {"type": "string", "minLength": 1},
+                "resource": {"type": "string", "minLength": 1},
+                "access_level": {"type": "string", "enum": ["read_only", "read_write"], "default": "read_only"},
+                "ticket_id": {"type": ["string", "null"]},
+            },
+            "required": ["employee_id", "resource"],
+        },
+        "output_shape": {"granted": "boolean", "employee_id": "string", "resource": "string", "access_level": "string"},
+        "side_effect": True,
+        "requires_approval": True,
+        "required_role": "it_support",
+        "require_auth_context": True,
+    },
 ]
 
 
@@ -247,7 +428,24 @@ def get_tool_spec(tool_name: str) -> dict[str, Any] | None:
     return next((spec for spec in TOOL_SPECS if spec["name"] == tool_name), None)
 
 
-def call_tool(tool_name: str, arguments: dict[str, Any], *, actor: str = "mcp", source: str = "mcp") -> dict:
+def call_tool(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    actor: str = "mcp",
+    source: str = "mcp",
+    auth_context: Any = None,
+) -> dict:
+    """Invoke a registered tool after enforcing the role gate from ``TOOL_SPECS``.
+
+    This is the single choke point for tool authorization: every caller — the
+    HTTP ``/api/mcp/call`` route, the intake service, the stdio bridge — goes
+    through here, so there is no path that bypasses the check.
+
+    ``auth_context`` is injected into the target function only when that
+    function declares the parameter, which keeps every pre-existing tool
+    signature untouched.
+    """
     started = time.perf_counter()
     tool = TOOL_REGISTRY.get(tool_name)
     if not tool:
@@ -260,37 +458,62 @@ def call_tool(tool_name: str, arguments: dict[str, Any], *, actor: str = "mcp", 
             actor=actor,
         )
         return result
-    try:
-        result = tool(**arguments)
-    except Exception as exc:
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        record_audit(
-            "mcp.tool_error",
-            "mcp_tool",
-            tool_name,
-            {
-                "source": source,
-                "arguments": arguments,
-                "error": str(exc),
-                "latency_ms": latency_ms,
-            },
-            actor=actor,
-        )
-        return {"error": str(exc), "tool_name": tool_name}
-    latency_ms = int((time.perf_counter() - started) * 1000)
-    record_audit(
-        "mcp.tool_call",
-        "mcp_tool",
+
+    spec = get_tool_spec(tool_name) or {}
+    decision = authorize_tool_call(
         tool_name,
-        {
-            "source": source,
-            "arguments": arguments,
-            "result_summary": _summarize_result(result),
-            "latency_ms": latency_ms,
-        },
-        actor=actor,
+        required_role=spec.get("required_role"),
+        require_auth_context=bool(spec.get("require_auth_context")),
+        auth_context=auth_context,
     )
+    if not decision.allowed:
+        result = denied_payload(tool_name, decision)
+    else:
+        call_arguments = dict(arguments)
+        if _accepts_auth_context(tool):
+            call_arguments["auth_context"] = auth_context
+        try:
+            result = tool(**call_arguments)
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            record_audit(
+                "mcp.tool_error",
+                "mcp_tool",
+                tool_name,
+                {
+                    "source": source,
+                    "arguments": arguments,
+                    "error": str(exc),
+                    "latency_ms": latency_ms,
+                },
+                actor=actor,
+            )
+            return {"error": str(exc), "tool_name": tool_name}
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    # A tool may refuse on its own (resource-level check) after passing the role
+    # gate above. Both refusals are recorded as denials, so the audit trail never
+    # shows a rejected call as an ordinary success.
+    denied = isinstance(result, dict) and result.get("error") == "forbidden"
+    detail = {
+        "source": source,
+        "arguments": arguments,
+        "result_summary": _summarize_result(result),
+        "latency_ms": latency_ms,
+    }
+    if denied:
+        detail["reason"] = result.get("reason")
+        detail["required_role"] = result.get("required_role")
+        detail["actor_role"] = result.get("actor_role")
+    record_audit("mcp.tool_denied" if denied else "mcp.tool_call", "mcp_tool", tool_name, detail, actor=actor)
     return result
+
+
+def _accepts_auth_context(tool: ToolFn) -> bool:
+    try:
+        return "auth_context" in inspect.signature(tool).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins and C callables
+        return False
 
 
 def _summarize_result(result: dict[str, Any]) -> dict[str, Any]:

@@ -45,6 +45,14 @@ TICKET_TIMELINE_MIGRATION_ID = "0012_ticket_timeline"
 TICKET_TIMELINE_MIGRATION_DESCRIPTION = "Add tenant-scoped operational ticket history"
 TICKET_SLA_MIGRATION_ID = "0013_ticket_sla"
 TICKET_SLA_MIGRATION_DESCRIPTION = "Add ticket due dates and terminal lifecycle timestamps"
+IT_SERVICE_FOUNDATION_MIGRATION_ID = "0014_it_service_foundation"
+IT_SERVICE_FOUNDATION_MIGRATION_DESCRIPTION = "Add the IT service directory (departments, employees, assets) and IT ticket intake fields"
+IT_RUN_TICKET_LINK_MIGRATION_ID = "0015_it_run_ticket_link"
+IT_RUN_TICKET_LINK_MIGRATION_DESCRIPTION = "Link a multi-agent run to the IT ticket it resolves, so an IT run replays as an IT run"
+IT_HISTORICAL_TICKETS_MIGRATION_ID = "0016_it_historical_tickets"
+IT_HISTORICAL_TICKETS_MIGRATION_DESCRIPTION = (
+    "Add the historical IT ticket reference corpus, kept separate from knowledge articles"
+)
 
 
 TENANT_RLS_TABLES = (
@@ -61,6 +69,9 @@ TENANT_RLS_TABLES = (
     "emails",
     "external_outbox",
     "audit_logs",
+    "departments",
+    "employees",
+    "assets",
 )
 
 RELATED_RLS_TABLES = (
@@ -473,6 +484,49 @@ def init_db(seed: bool | None = None) -> None:
                 FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS departments (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                cost_center TEXT,
+                head_user_id TEXT,
+                parent_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS employees (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                department_id TEXT NOT NULL,
+                manager_id TEXT,
+                title TEXT,
+                employment_status TEXT NOT NULL DEFAULT 'active',
+                location TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS assets (
+                id TEXT PRIMARY KEY,
+                hostname TEXT,
+                asset_type TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                environment TEXT NOT NULL DEFAULT 'dev',
+                owner_user_id TEXT,
+                department_id TEXT,
+                model TEXT,
+                serial TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                criticality TEXT NOT NULL DEFAULT 'normal',
+                patch_level TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS tickets (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -490,6 +544,12 @@ def init_db(seed: bool | None = None) -> None:
                 due_at TEXT,
                 resolved_at TEXT,
                 closed_at TEXT,
+                requester_user_id TEXT,
+                it_category TEXT,
+                service TEXT,
+                asset_id TEXT,
+                environment TEXT,
+                triage_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (customer_id) REFERENCES customers(id)
@@ -579,6 +639,29 @@ def init_db(seed: bool | None = None) -> None:
                 report_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            -- How past IT incidents were actually handled. Deliberately its own
+            -- table rather than rows in ``knowledge_articles``: an article is an
+            -- approved policy or runbook and a historical ticket is one
+            -- engineer's past improvisation, and a resolution must be able to
+            -- follow the first while merely noting the second. Keeping them
+            -- apart is what makes that distinction checkable rather than a
+            -- matter of prompt wording.
+            CREATE TABLE IF NOT EXISTS it_historical_tickets (
+                id TEXT PRIMARY KEY,
+                ticket_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                resolution_action TEXT,
+                environment TEXT,
+                asset_id TEXT,
+                status TEXT NOT NULL,
+                resolved_at TEXT,
+                created_at TEXT NOT NULL
+            );
             """
         )
         _ensure_column(conn, "workflow_steps", "attempt_count", "INTEGER NOT NULL DEFAULT 1")
@@ -608,6 +691,10 @@ def init_db(seed: bool | None = None) -> None:
         _ensure_column(conn, "multi_agent_runs", "replay_of_run_id", "TEXT")
         _ensure_column(conn, "multi_agent_runs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
         _ensure_column(conn, "multi_agent_runs", "requester_role", "TEXT")
+        # Nullable, no default: a non-IT run keeps NULL and its stored state is
+        # byte-identical to before. Without this the trace replayer would re-run
+        # an IT run in non-IT mode and emit a structurally different trace.
+        _ensure_column(conn, "multi_agent_runs", "it_ticket_id", "TEXT")
         _ensure_column(conn, "multi_agent_tasks", "duration_ms", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "agent_memory", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
         _ensure_column(conn, "golden_traces", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
@@ -620,6 +707,12 @@ def init_db(seed: bool | None = None) -> None:
         _ensure_column(conn, "tickets", "due_at", "TEXT")
         _ensure_column(conn, "tickets", "resolved_at", "TEXT")
         _ensure_column(conn, "tickets", "closed_at", "TEXT")
+        _ensure_column(conn, "tickets", "requester_user_id", "TEXT")
+        _ensure_column(conn, "tickets", "it_category", "TEXT")
+        _ensure_column(conn, "tickets", "service", "TEXT")
+        _ensure_column(conn, "tickets", "asset_id", "TEXT")
+        _ensure_column(conn, "tickets", "environment", "TEXT")
+        _ensure_column(conn, "tickets", "triage_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "emails", "provider", "TEXT NOT NULL DEFAULT 'mock'")
         _ensure_column(conn, "emails", "external_message_id", "TEXT")
         _ensure_column(conn, "emails", "error_message", "TEXT")
@@ -651,8 +744,14 @@ def init_db(seed: bool | None = None) -> None:
         _record_schema_migration(conn, CRM_FOUNDATION_MIGRATION_ID, CRM_FOUNDATION_MIGRATION_DESCRIPTION)
         _record_schema_migration(conn, TICKET_TIMELINE_MIGRATION_ID, TICKET_TIMELINE_MIGRATION_DESCRIPTION)
         _record_schema_migration(conn, TICKET_SLA_MIGRATION_ID, TICKET_SLA_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, IT_SERVICE_FOUNDATION_MIGRATION_ID, IT_SERVICE_FOUNDATION_MIGRATION_DESCRIPTION)
+        _record_schema_migration(conn, IT_RUN_TICKET_LINK_MIGRATION_ID, IT_RUN_TICKET_LINK_MIGRATION_DESCRIPTION)
+        _record_schema_migration(
+            conn, IT_HISTORICAL_TICKETS_MIGRATION_ID, IT_HISTORICAL_TICKETS_MIGRATION_DESCRIPTION
+        )
     if settings.auto_seed if seed is None else seed:
         seed_demo_data(purpose="migration")
+        seed_it_data(purpose="migration")
 
 
 def database_status(*, purpose: str = "readonly") -> dict[str, Any]:
@@ -896,6 +995,18 @@ def _ensure_indexes(conn: sqlite3.Connection | PostgresConnection) -> None:
             ON audit_logs(event_type, target_type, target_id);
         CREATE INDEX IF NOT EXISTS idx_audit_logs_row_hash
             ON audit_logs(row_hash);
+        CREATE INDEX IF NOT EXISTS idx_employees_tenant_dept
+            ON employees(tenant_id, department_id);
+        CREATE INDEX IF NOT EXISTS idx_assets_tenant_env
+            ON assets(tenant_id, environment);
+        CREATE INDEX IF NOT EXISTS idx_assets_owner
+            ON assets(owner_user_id);
+        CREATE INDEX IF NOT EXISTS idx_tickets_tenant_it_category
+            ON tickets(tenant_id, it_category);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_it_history_ticket_id
+            ON it_historical_tickets(ticket_id);
+        CREATE INDEX IF NOT EXISTS idx_it_history_tenant_category
+            ON it_historical_tickets(tenant_id, category);
         """
     )
 
@@ -1174,4 +1285,235 @@ def seed_demo_data(purpose: str | None = None) -> None:
                 VALUES (?, ?, 'default', ?, 'active', ?, ?, 'Customer Success', ?, ?, ?)
                 """,
                 (*customer, now, now),
+            )
+
+
+def seed_it_data(purpose: str | None = None) -> None:
+    """Seed the mock IT directory, its logins, and the IT knowledge base.
+
+    Fully idempotent and entirely local: every row comes from
+    ``app.services.it.mock_data`` and no external system is contacted.
+    """
+    _seed_it_directory(purpose=purpose)
+    _ensure_it_employee_accounts()
+    seed_it_knowledge(purpose=purpose)
+    seed_it_history(purpose=purpose)
+
+
+# The IT knowledge base the resolution loop reasons over. Content is generic
+# operational guidance, written for this mock platform: no real company, runbook
+# or credential appears here.
+#
+# Categories are deliberately ``it_service`` / ``it_policy`` rather than reusing
+# ``incident`` / ``security`` / ``compliance`` from ``seed_demo_data``.
+# ``search_knowledge`` awards a point when an article's category appears in the
+# query text, so sharing a category with the business corpus would let business
+# articles bleed into IT retrieval (and vice versa) for no benefit.
+IT_KNOWLEDGE_ARTICLES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "Redis 生产故障排查手册",
+        "it_service",
+        "Redis 连接不可用时，按只读诊断优先的顺序处理：先确认实例是否存在且状态为 active，再检查内存压力、连接数饱和与近期错误，"
+        "这些都可以通过 diagnose_service 只读完成，不需要授权。确认是内存碎片或热点 key 导致响应变慢时，可以清理缓存 flush_cache，"
+        "该操作可逆，非生产环境可直接执行，生产环境必须先取得人工审批。确认实例已经无响应时，标准处置是重启服务 restart_service，"
+        "重启会造成秒级中断，因此无论环境都必须先经过人工审批，生产环境还需要 it_admin 权限。"
+        "任何情况下都不允许删除数据、回收权限或停用账号，这些动作在风险门禁中被直接拒绝。",
+        "redis,incident,restart,cache,production",
+    ),
+    (
+        "IT 生产变更与权限管理规范",
+        "it_policy",
+        "所有生产环境的变更都必须留下审批记录，Agent 可以准备方案和影响范围，但不能自行执行。"
+        "权限申请需要记录申请人、目标资源、权限级别和业务理由；只读权限由资源负责人审批，读写权限必须由 IT 管理员审批。"
+        "生产资源的任何权限授予都需要 IT 管理员审批，不论级别。"
+        "权限回收、数据删除和账号停用属于高危动作，不在自动化范围内，必须由人工在平台之外处理。",
+        "permission,approval,access,production,policy",
+    ),
+    (
+        "IT 事件分级与响应时限",
+        "it_policy",
+        "生产环境中核心服务不可用属于紧急事件，包括 redis、数据库、vpn 网关和网络设备，需要在 15 分钟内响应并创建工单。"
+        "非生产环境的故障默认按普通优先级处理。"
+        "当请求中缺少服务名称或环境信息时，应当先向报障人补充信息，而不是推测一个答案后继续处理。",
+        "incident,priority,sla,urgent",
+    ),
+    (
+        "员工设备与软件申请指引",
+        "it_service",
+        "设备申请需要直属主管确认，资产从 IT 库存中分配并登记归属人。"
+        "免费软件可以自助安装，付费或需要授权的软件需要走采购审批，并在工单中记录预算部门和业务理由。"
+        "软件申请本身不涉及生产变更，通常只需要分派给对应处理团队。",
+        "asset,software,laptop,docker",
+    ),
+)
+
+
+def seed_it_knowledge(purpose: str | None = None) -> None:
+    """Seed the deterministic IT knowledge base used by the resolution loop.
+
+    Idempotent **per document**, matched on ``title``. This is deliberately not
+    ``seed_demo_data``'s ``SELECT COUNT(*) FROM knowledge_articles`` guard: that
+    one returns early if *any* article exists, which would silently skip the IT
+    corpus whenever the business corpus was seeded first. Matching on title means
+    the two seeders compose in either order and either one can be re-run.
+    """
+    with get_connection(purpose=purpose) as conn:
+        existing = {
+            row["title"]
+            for row in conn.execute("SELECT title FROM knowledge_articles").fetchall()
+        }
+        now = utc_now()
+        for title, category, content, tags in IT_KNOWLEDGE_ARTICLES:
+            if title in existing:
+                continue
+            conn.execute(
+                """
+                INSERT INTO knowledge_articles
+                (id, title, category, content, tags, visibility, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'internal', ?, ?)
+                """,
+                (new_id("kb"), title, category, content, tags, now, now),
+            )
+
+
+def seed_it_history(purpose: str | None = None) -> None:
+    """Seed the historical IT ticket corpus the resolution agent reads from.
+
+    Idempotent **per ticket**, matched on ``ticket_id``, for the same reason as
+    ``seed_it_knowledge``: this runs on every ``init_db(seed=True)`` and on the
+    admin seed endpoint, so it has to be safe to re-run and safe to combine with
+    either of the other seeders in any order.
+
+    The corpus is reference material only. It is never joined against ``tickets``
+    and never drives a state transition.
+    """
+    from app.services.it.mock_data import MOCK_HISTORICAL_TICKETS
+
+    with get_connection(purpose=purpose) as conn:
+        existing = {
+            row["ticket_id"]
+            for row in conn.execute("SELECT ticket_id FROM it_historical_tickets").fetchall()
+        }
+        now = utc_now()
+        for ticket in MOCK_HISTORICAL_TICKETS:
+            ticket_id = ticket["ticket_id"]
+            if ticket_id in existing:
+                continue
+            conn.execute(
+                """
+                INSERT INTO it_historical_tickets
+                (id, ticket_id, tenant_id, category, title, description, resolution,
+                 resolution_action, environment, asset_id, status, resolved_at, created_at)
+                VALUES (?, ?, 'default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id("ithist"),
+                    ticket_id,
+                    ticket["category"],
+                    ticket["title"],
+                    ticket["description"],
+                    ticket["resolution"],
+                    ticket.get("resolution_action"),
+                    ticket.get("environment"),
+                    ticket.get("asset_id"),
+                    ticket["status"],
+                    now,
+                    now,
+                ),
+            )
+
+
+def _seed_it_directory(purpose: str | None = None) -> None:
+    # Imported lazily: ``mock_data`` deliberately imports nothing from ``app.*``
+    # so this stays a one-way dependency.
+    from app.services.it.mock_data import MOCK_ASSETS, MOCK_DEPARTMENTS, MOCK_EMPLOYEES
+
+    with get_connection(purpose=purpose) as conn:
+        existing = conn.execute("SELECT COUNT(*) AS count FROM departments").fetchone()["count"]
+        if existing:
+            return
+        now = utc_now()
+        for department in MOCK_DEPARTMENTS:
+            conn.execute(
+                """
+                INSERT INTO departments
+                (id, name, tenant_id, cost_center, head_user_id, parent_id, created_at, updated_at)
+                VALUES (?, ?, 'default', ?, ?, ?, ?, ?)
+                """,
+                (
+                    department["id"],
+                    department["name"],
+                    department.get("cost_center"),
+                    department.get("head_user_id"),
+                    department.get("parent_id"),
+                    now,
+                    now,
+                ),
+            )
+        for employee in MOCK_EMPLOYEES:
+            conn.execute(
+                """
+                INSERT INTO employees
+                (id, display_name, email, tenant_id, department_id, manager_id, title,
+                 employment_status, location, created_at, updated_at)
+                VALUES (?, ?, ?, 'default', ?, ?, ?, 'active', ?, ?, ?)
+                """,
+                (
+                    employee["id"],
+                    employee["display_name"],
+                    employee["email"],
+                    employee["department_id"],
+                    employee.get("manager_id"),
+                    employee.get("title"),
+                    employee.get("location"),
+                    now,
+                    now,
+                ),
+            )
+        for asset in MOCK_ASSETS:
+            conn.execute(
+                """
+                INSERT INTO assets
+                (id, hostname, asset_type, tenant_id, environment, owner_user_id, department_id,
+                 model, serial, status, criticality, patch_level, metadata_json, created_at, updated_at)
+                VALUES (?, ?, ?, 'default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    asset["id"],
+                    asset.get("hostname"),
+                    asset["asset_type"],
+                    asset["environment"],
+                    asset.get("owner_user_id"),
+                    asset.get("department_id"),
+                    asset.get("model"),
+                    asset.get("serial"),
+                    asset.get("status", "active"),
+                    asset.get("criticality", "normal"),
+                    asset.get("patch_level"),
+                    json_dumps(asset.get("metadata") or {}),
+                    now,
+                    now,
+                ),
+            )
+
+
+def _ensure_it_employee_accounts() -> None:
+    """Give every mock employee a login.
+
+    ``AuthContext.user_id`` is the same value as ``employees.id``, so an
+    authenticated caller resolves against the directory without a mapping table.
+    Uses the same ``get_user`` guard as ``ensure_demo_users`` so an existing
+    password is never rewritten.
+    """
+    from app.services.auth import create_user, get_user
+    from app.services.it.mock_data import MOCK_EMPLOYEES
+
+    for employee in MOCK_EMPLOYEES:
+        if not get_user(employee["id"]):
+            create_user(
+                employee["id"],
+                employee["display_name"],
+                employee["department_id"],
+                employee["role"],
+                employee["password"],
             )

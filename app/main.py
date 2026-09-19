@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.config import BASE_DIR, settings
-from app.db import clear_run_history, database_status, init_db, list_schema_migrations, reset_database
+from app.db import clear_run_history, database_status, init_db, list_schema_migrations, reset_database, seed_it_data
 from app.schemas import (
     ApprovalDecisionRequest,
     AuthLoginRequest,
@@ -27,6 +27,8 @@ from app.schemas import (
     CustomerUpdate,
     GoldenTraceCreate,
     GoldenTraceDiffRequest,
+    ITRequestCreate,
+    ITResolveRequest,
     KnowledgeArticleCreate,
     MultiAgentRunRequest,
     TicketCommentCreate,
@@ -38,7 +40,12 @@ from app.schemas import (
     WorkflowRunRequest,
 )
 from app.services.agent import decide_approval_and_resume, get_run_detail, list_runs, run_workflow
-from app.services.audit import list_audit_logs, verify_audit_log_integrity
+from app.services.audit import (
+    list_audit_logs,
+    list_it_audit_chain,
+    record_audit,
+    verify_audit_log_integrity,
+)
 from app.services.auth import (
     AuthContext,
     AuthError,
@@ -57,6 +64,7 @@ from app.services.metrics import metrics_summary, prometheus_metrics
 from app.services.multi_agent import (
     diff_trace,
     export_multi_agent_trace,
+    find_multi_agent_run_by_it_ticket,
     get_multi_agent_run,
     list_agent_checkpoints,
     list_golden_traces,
@@ -111,6 +119,8 @@ from app.services.tools.crm import (
 from app.services.tools.email import list_emails
 from app.services.tools.knowledge import create_article, list_articles, search_knowledge
 from app.services.tools.registry import call_tool, list_tool_specs
+from app.services.it.intake import original_request_text, submit_it_request
+from app.services.it.triage import classify
 from app.services.tools.ticketing import (
     add_ticket_comment,
     get_ticket,
@@ -230,6 +240,9 @@ async def startup() -> None:
     if settings.auto_migrate:
         init_db(seed=settings.auto_seed)
         ensure_demo_users()
+        # Mirrors ensure_demo_users: the mock IT directory is idempotent and is
+        # guaranteed present on every boot, including when auto_seed is off.
+        seed_it_data()
     if settings.embedded_outbox_dispatcher_enabled:
         app.state.outbox_dispatcher_task = asyncio.create_task(outbox_dispatcher_loop())
 
@@ -838,12 +851,18 @@ def scim_user_get(user_id: str, _: None = Depends(_require_scim_token)) -> dict:
 
 @app.put("/scim/v2/Users/{user_id}")
 def scim_user_replace(user_id: str, payload: dict[str, Any], _: None = Depends(_require_scim_token)) -> dict:
-    return replace_scim_user(user_id, payload)
+    try:
+        return replace_scim_user(user_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.patch("/scim/v2/Users/{user_id}")
 def scim_user_patch(user_id: str, payload: dict[str, Any], _: None = Depends(_require_scim_token)) -> dict:
-    user = patch_scim_user(user_id, payload)
+    try:
+        user = patch_scim_user(user_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not user:
         raise HTTPException(status_code=404, detail="SCIM user not found.")
     return user
@@ -1397,7 +1416,246 @@ def mcp_call(request: ToolCallRequest, auth_context: AuthContext | None = Depend
         arguments,
         actor=auth_context.user_id if auth_context else "mcp-http",
         source="http",
+        auth_context=auth_context,
     )
     if "error" in result:
-        raise HTTPException(status_code=400, detail=result)
+        status_code = 403 if result["error"] == "forbidden" else 400
+        raise HTTPException(status_code=status_code, detail=result)
     return {"tool_name": request.tool_name, "result": result}
+
+
+@app.post("/api/it/requests", status_code=201)
+def it_submit_request(
+    request: ITRequestCreate,
+    auth_context: AuthContext = Depends(_required_auth_context),
+) -> dict:
+    """Run the Phase 1 IT intake loop for the authenticated requester.
+
+    Authentication is mandatory here regardless of ``settings.auth_required``:
+    the IT intake's authorization model is entirely built on who is asking, so
+    an anonymous submission has no meaning.
+    """
+    try:
+        return submit_it_request(request.objective, auth_context=auth_context, tenant_id=request.tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+IT_RESOLVABLE_STATUSES = frozenset({"open", "investigating"})
+"""The only two ticket states from which resolution is meaningful.
+
+``open`` is moved to ``investigating`` first — ``open -> investigating`` is a
+legal transition and it is what tells a human reading the ticket that an agent
+picked it up. Everything else (``waiting_approval``, ``resolved``, ...) is
+already downstream of a decision, and re-entering the loop there would either
+be a no-op or a second execution.
+"""
+
+
+def _it_loop_state(run_id: str | None) -> dict:
+    """Recover the IT loop's intermediate results from the run's checkpoints.
+
+    ``multi_agent_runs`` stores the run's own columns, not the graph state, so
+    the triage / resolution / risk decision live only in ``agent_checkpoints``.
+    Each checkpoint carries the whole state it observed, so replaying them in
+    order and letting later ones win reconstructs the final picture.
+    """
+    if not run_id:
+        return {}
+    state: dict = {}
+    for checkpoint in list_agent_checkpoints(run_id):
+        snapshot = checkpoint.get("state")
+        if isinstance(snapshot, dict):
+            state.update(snapshot)
+    return state
+
+
+@app.post("/api/it/requests/{ticket_id}/resolve")
+def it_resolve_request(
+    ticket_id: str,
+    request: ITResolveRequest,
+    auth_context: AuthContext = Depends(_required_auth_context),
+) -> dict:
+    """Drive one IT ticket through Triage -> RAG -> Resolution -> Risk Gate.
+
+    This is the Phase 2 entry point. It does not execute anything itself: the
+    graph decides, the deterministic risk gate classifies, and a high-risk
+    action stops at the ``interrupt`` with a ``waiting_approval`` ticket. Only
+    ``open`` and ``investigating`` tickets can be resolved — anything else is
+    already past the point where resolution would mean anything.
+    """
+    ticket = get_ticket(ticket_id)
+    if not ticket or not _row_visible_to_context(ticket, auth_context):
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+    if ticket.get("status") not in IT_RESOLVABLE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ticket status {ticket.get('status')!r} cannot be resolved; expected one of {sorted(IT_RESOLVABLE_STATUSES)}.",
+        )
+    if ticket.get("status") == "open":
+        moved = call_tool(
+            "update_ticket",
+            {
+                "ticket_id": ticket_id,
+                "status": "investigating",
+                "actor": auth_context.user_id,
+                "comment": "Phase 2 resolution loop started.",
+                "tenant_id": auth_context.tenant_id,
+            },
+            actor=auth_context.user_id,
+            source="http",
+            auth_context=auth_context,
+        )
+        if moved.get("error"):
+            raise HTTPException(status_code=403 if moved["error"] == "forbidden" else 400, detail=moved)
+        ticket = get_ticket(ticket_id) or ticket
+
+    objective = (request.objective or "").strip() or original_request_text(ticket)
+    if not objective:
+        raise HTTPException(status_code=400, detail="objective is required.")
+    run = run_multi_agent(
+        objective,
+        requester_user_id=ticket.get("requester_user_id") or auth_context.user_id,
+        requester_department=auth_context.department,
+        requester_role=auth_context.role,
+        tenant_id=request.tenant_id or ticket.get("tenant_id") or auth_context.tenant_id,
+        enable_self_correction=request.enable_self_correction,
+        max_correction_attempts=request.max_correction_attempts,
+        it_ticket_id=ticket_id,
+    )
+    record_audit(
+        "it.ticket_linked",
+        "ticket",
+        ticket_id,
+        {
+            "multi_agent_run_id": run.get("id"),
+            "workflow_run_id": run.get("workflow_run_id"),
+            "status": run.get("status"),
+            "requester": ticket.get("requester_user_id"),
+        },
+        actor=auth_context.user_id,
+        tenant_id=request.tenant_id or ticket.get("tenant_id") or auth_context.tenant_id,
+    )
+    loop = _it_loop_state(run.get("id"))
+    return {
+        "ticket_id": ticket_id,
+        "multi_agent_run_id": run.get("id"),
+        "workflow_run_id": run.get("workflow_run_id"),
+        "status": run.get("status"),
+        "ticket_status": (get_ticket(ticket_id) or {}).get("status"),
+        "triage": loop.get("it_triage"),
+        "resolution": loop.get("it_resolution"),
+        "risk_decision": loop.get("it_risk_decision"),
+        "execution": loop.get("it_execution"),
+        "approval": _it_pending_approval(run.get("workflow_run_id")),
+        "run": run,
+    }
+
+
+def _it_pending_approval(workflow_run_id: str | None) -> dict | None:
+    """The approval a human still has to decide, if the run stopped for one."""
+    if not workflow_run_id:
+        return None
+    return next(
+        (item for item in list_approvals(limit=200) if item.get("run_id") == workflow_run_id and item.get("status") == "pending"),
+        None,
+    )
+
+
+@app.get("/api/it/requests/{ticket_id}")
+def it_get_request(ticket_id: str, auth_context: AuthContext = Depends(_required_auth_context)) -> dict:
+    """Return one IT ticket with its triage record and event timeline."""
+    ticket = get_ticket(ticket_id)
+    if not ticket or not _row_visible_to_context(ticket, auth_context):
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+    return {
+        "ticket": ticket,
+        "triage": ticket.get("triage") or {},
+        "events": list_ticket_events(ticket_id, tenant_id=_tenant_scope(auth_context), limit=200),
+    }
+
+
+def _it_run_approval(workflow_run_id: str | None) -> dict | None:
+    """The approval that gated this run, pending or already decided.
+
+    ``_it_pending_approval`` answers "what does a human still have to do", which
+    is the question the resolve endpoint is asked. The chain view needs the
+    other question — "what did the human decide" — so after a decision it must
+    still return the row, or the step that explains the execution goes blank
+    exactly when it becomes interesting.
+    """
+    if not workflow_run_id:
+        return None
+    candidates = [
+        item for item in list_approvals(limit=200) if item.get("run_id") == workflow_run_id
+    ]
+    if not candidates:
+        return None
+    pending = next((item for item in candidates if item.get("status") == "pending"), None)
+    return pending or candidates[0]
+
+
+@app.get("/api/it/requests/{ticket_id}/chain")
+def it_request_chain(
+    ticket_id: str, auth_context: AuthContext = Depends(_required_auth_context)
+) -> dict:
+    """The whole decision chain for one ticket, in one read-only response.
+
+    This is what answers "why did the agent do that?" without replaying the run.
+    Each stage of the graph left its result in a checkpoint, and each stage also
+    wrote an audit row; returning both lets a reader check the recorded decision
+    against the recorded inputs rather than trusting the summary.
+
+    Read-only by construction: no tool is called, nothing is executed, and a
+    ticket the caller cannot see is a 404 rather than a 403 so that the route
+    does not confirm the existence of other tenants' tickets.
+    """
+    ticket = get_ticket(ticket_id)
+    if not ticket or not _row_visible_to_context(ticket, auth_context):
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+    run = find_multi_agent_run_by_it_ticket(ticket_id, tenant_id=_tenant_scope(auth_context))
+    loop = _it_loop_state((run or {}).get("id"))
+    return {
+        "ticket": ticket,
+        "triage": ticket.get("triage") or loop.get("it_triage") or {},
+        "resolution": loop.get("it_resolution"),
+        "risk_decision": loop.get("it_risk_decision"),
+        "execution": loop.get("it_execution"),
+        "history": loop.get("it_history"),
+        "approval": _it_run_approval((run or {}).get("workflow_run_id")),
+        "run": run,
+        "events": list_ticket_events(ticket_id, tenant_id=_tenant_scope(auth_context), limit=200),
+        "audit": list_it_audit_chain(ticket_id, tenant_id=_tenant_scope(auth_context)),
+    }
+
+
+@app.get("/api/it/triage/preview")
+def it_triage_preview(
+    objective: str = Query(min_length=1),
+    auth_context: AuthContext | None = Depends(_optional_auth_context),
+) -> dict:
+    """Classify a request without creating a ticket. Deterministic rules only."""
+    return {"objective": objective, "triage": classify(objective).to_dict()}
+
+
+@app.get("/api/it/employees/{employee_id}")
+def it_get_employee(employee_id: str, auth_context: AuthContext = Depends(_required_auth_context)) -> dict:
+    """Directory lookup. Routed through ``call_tool`` so RBAC applies identically.
+
+    Authentication is required at the edge even when ``settings.auth_required``
+    is off, so an anonymous caller gets a clean 401 instead of a 403 from the
+    tool gate.
+    """
+    result = call_tool("get_employee", {"employee_id": employee_id}, actor=auth_context.user_id, source="http", auth_context=auth_context)
+    if "error" in result:
+        raise HTTPException(status_code=403 if result["error"] == "forbidden" else 400, detail=result)
+    return result
+
+
+@app.get("/api/it/assets/{asset_id}")
+def it_get_asset(asset_id: str, auth_context: AuthContext = Depends(_required_auth_context)) -> dict:
+    """Asset lookup. Production assets are redacted for callers below it_support."""
+    result = call_tool("get_asset", {"asset_id": asset_id}, actor=auth_context.user_id, source="http", auth_context=auth_context)
+    if "error" in result:
+        raise HTTPException(status_code=403 if result["error"] == "forbidden" else 400, detail=result)
+    return result

@@ -30,7 +30,7 @@ class UserCreate(BaseModel):
     id: str = Field(min_length=1, max_length=80)
     display_name: str = Field(min_length=1, max_length=120)
     department: str = Field(min_length=1, max_length=120)
-    role: str = Field(pattern="^(admin|manager|employee)$")
+    role: str = Field(pattern="^(admin|manager|employee|it_support|it_admin)$")
     password: str = Field(min_length=8)
     tenant_id: str | None = None
 
@@ -147,6 +147,28 @@ class KnowledgeArticleCreate(BaseModel):
 class ToolCallRequest(BaseModel):
     tool_name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ITRequestCreate(BaseModel):
+    """A free-text IT service request submitted through the Phase 1 intake loop."""
+
+    objective: str = Field(min_length=1, max_length=2000)
+    tenant_id: str | None = None
+
+
+class ITResolveRequest(BaseModel):
+    """Drive an existing IT ticket through the Phase 2 resolution loop.
+
+    ``objective`` defaults to the ticket's own recorded request. Self-correction
+    defaults to *off*: an IT action is not made more correct by replanning, and
+    every extra pass through the graph is another chance to reach the execution
+    branch.
+    """
+
+    objective: str | None = Field(default=None, min_length=1, max_length=2000)
+    enable_self_correction: bool = False
+    max_correction_attempts: int = Field(default=1, ge=1, le=5)
+    tenant_id: str | None = None
 
 
 class ApiMessage(BaseModel):

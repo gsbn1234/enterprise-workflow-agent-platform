@@ -19,6 +19,7 @@ import {
   RotateCcw,
   SearchCheck,
   Send,
+  Server,
   ShieldCheck,
   Ticket,
   UserRound,
@@ -661,6 +662,11 @@ function Workspace({ user, onMessage }) {
           <ProgressTimeline steps={buildProgressSteps({ busy, run: currentRun, note: resultNote, decision: currentDecision, artifacts: currentArtifacts })} />
         </Card>
 
+        <Card className="it-service-card">
+          <PanelHeader icon={Server} title="IT 服务" kicker="IT Service" />
+          <ITServicePanel user={user} onMessage={onMessage} />
+        </Card>
+
         <Card>
           <PanelHeader icon={SearchCheck} title="决策解释" kicker="Why" />
           <DecisionSummary decision={currentDecision} />
@@ -1131,6 +1137,373 @@ function buildProgressSteps({ busy, run, note, decision, artifacts }) {
       state: completed ? "done" : status === "waiting_approval" ? "waiting" : "todo",
     },
   ];
+}
+
+const IT_DEMO_OBJECTIVE = "我的生产 Redis 连不上了";
+
+function ITServicePanel({ user, onMessage }) {
+  const [objective, setObjective] = useState(IT_DEMO_OBJECTIVE);
+  const [ticketId, setTicketId] = useState("");
+  const [chain, setChain] = useState(null);
+  const [busy, setBusy] = useState("");
+  const [note, setNote] = useState(null);
+
+  const canDecide = APPROVER_ROLES.has(user.role);
+
+  // One reader for the whole panel. The resolve response and the chain response
+  // are two shapes of the same run, and the chain is the complete one — after an
+  // approval the resolve response is a stale snapshot that never learns how the
+  // human answered, so everything past submission is read from here.
+  const loadChain = useCallback(async (id) => {
+    const next = await api(`/api/it/requests/${id}/chain`);
+    setChain(next);
+    return next;
+  }, []);
+
+  const submit = async () => {
+    const text = objective.trim();
+    if (!text || busy) return;
+    setBusy("submit");
+    setNote(null);
+    try {
+      const intake = await api("/api/it/requests", {
+        method: "POST",
+        body: JSON.stringify({ objective: text }),
+      });
+      setTicketId(intake.ticket_id);
+      setBusy("resolve");
+      const resolved = await api(`/api/it/requests/${intake.ticket_id}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      await loadChain(intake.ticket_id);
+      setNote({
+        status: resolved.status,
+        detail:
+          resolved.status === "waiting_approval"
+            ? "已停在人工审批：风险门禁要求有人确认后才能执行。"
+            : resolved.status === "cancelled"
+              ? "风险门禁拒绝了本次动作，未执行任何工具。"
+              : "链路已跑完，可查看下面九个步骤。",
+      });
+    } catch (err) {
+      setNote({ status: "failed", detail: err.message || "IT 请求处理失败。" });
+      onMessage?.(err.message || "IT 请求处理失败。", "error");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const decide = async (approvalId, approved) => {
+    if (busy) return;
+    setBusy(`decide:${approvalId}`);
+    try {
+      await api(`/api/approvals/${approvalId}/decide`, {
+        method: "POST",
+        body: JSON.stringify({
+          approved,
+          decided_by: user.id,
+          reason: approved ? "IT 服务面板批准" : "IT 服务面板拒绝",
+        }),
+      });
+      await loadChain(ticketId);
+      setNote({
+        status: approved ? "approved" : "denied",
+        detail: approved ? "审批通过，动作已执行。" : "审批被拒，动作未执行。",
+      });
+      onMessage?.(approved ? "审批已通过" : "审批已拒绝");
+    } catch (err) {
+      // Surfaced rather than swallowed: a refusal here is the permission model
+      // working, and the reason it gives is the point.
+      setNote({ status: "failed", detail: err.message || "审批失败。" });
+      onMessage?.(err.message || "审批失败。", "error");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <div className="it-panel">
+      <div className="it-panel-input">
+        <textarea
+          rows={2}
+          value={objective}
+          onChange={(event) => setObjective(event.target.value)}
+          placeholder="描述你的 IT 问题，例如：我的生产 Redis 连不上了"
+        />
+        <div className="it-panel-actions">
+          <IconButton icon={Send} label={busy === "submit" ? "提交中" : "提交 IT 请求"} disabled={Boolean(busy)} onClick={submit} />
+          {busy === "resolve" ? <span className="muted">正在运行 Triage → 检索 → 决议 → 风控…</span> : null}
+          {ticketId ? <span className="muted">{ticketId}</span> : null}
+        </div>
+      </div>
+
+      {note ? (
+        <div className={`it-note ${note.status}`}>
+          <Status value={note.status} />
+          <span>{note.detail}</span>
+        </div>
+      ) : null}
+
+      {chain ? (
+        <ITChain
+          chain={chain}
+          canDecide={canDecide}
+          role={user.role}
+          busy={busy}
+          onDecide={decide}
+          onRefresh={() => ticketId && loadChain(ticketId)}
+        />
+      ) : (
+        <Empty text="提交一个 IT 请求后，这里会显示从工单到执行结果的完整链路" />
+      )}
+    </div>
+  );
+}
+
+function ITChain({ chain, canDecide, role, busy, onDecide, onRefresh }) {
+  const ticket = chain.ticket || {};
+  const triage = chain.triage || {};
+  const resolution = chain.resolution || {};
+  const risk = chain.risk_decision || {};
+  const execution = chain.execution || {};
+  const approval = chain.approval || null;
+  const history = resolution.historical_evidence || [];
+  const knowledge = resolution.evidence || [];
+
+  const steps = [
+    {
+      key: "ticket",
+      title: "Ticket 受理",
+      state: "done",
+      detail: (
+        <>
+          <code>{ticket.id}</code> · <Status value={ticket.status} /> · {ticket.priority || "-"} ·{" "}
+          {ticket.asset_id || "无关联资产"}
+        </>
+      ),
+    },
+    {
+      key: "triage",
+      title: "Triage 分类",
+      state: triage.category ? "done" : "todo",
+      detail: (
+        <>
+          {triage.intent || "-"} · {triage.category || "-"} · {triage.priority || "-"} · 环境{" "}
+          {triage.entities?.environment || "未标注"}
+          {triage.missing_information?.length ? ` · 缺失信息 ${triage.missing_information.join("、")}` : ""}
+        </>
+      ),
+    },
+    {
+      key: "knowledge",
+      title: "Knowledge 检索（正式知识 / 政策 / Runbook）",
+      state: knowledge.length ? "done" : "todo",
+      detail: (
+        <ITEvidenceList
+          tone="knowledge"
+          items={knowledge.map((item) => ({
+            key: item.article_id || item.title,
+            title: item.title,
+            meta: `${item.source || "-"} · score ${item.score ?? "-"}`,
+            body: item.snippet,
+          }))}
+          empty="未检索到可引用的正式知识"
+        />
+      ),
+    },
+    {
+      key: "history",
+      title: "Historical Ticket 检索（历史工单，仅供参考）",
+      state: history.length ? "done" : "todo",
+      detail: (
+        <>
+          <div className="it-badges">
+            <span className={`it-badge ${resolution.historical_reference ? "warn" : "muted"}`}>
+              historical_reference={String(Boolean(resolution.historical_reference))}
+            </span>
+            <span className={`it-badge ${resolution.historical_divergence ? "warn" : "muted"}`}>
+              historical_divergence={String(Boolean(resolution.historical_divergence))}
+            </span>
+          </div>
+          <ITEvidenceList
+            tone="historical"
+            items={history.map((item) => ({
+              key: item.ticket_id,
+              title: `${item.ticket_id} · ${item.title}`,
+              meta: `${item.category || "-"} · ${item.environment || "-"} · similarity ${item.similarity ?? "-"} · 当时的动作 ${item.resolution_action || "-"}`,
+              body: item.snippet,
+            }))}
+            empty="未检索到相似历史工单"
+          />
+          {resolution.historical_note ? <p className="muted">{resolution.historical_note}</p> : null}
+        </>
+      ),
+    },
+    {
+      key: "resolution",
+      title: "Resolution 决议",
+      state: resolution.status ? "done" : "todo",
+      detail: (
+        <>
+          <Status value={resolution.status} /> · {resolution.action_type || "-"} · 目标{" "}
+          {resolution.target || "-"} · 环境 {resolution.environment || "-"}
+          <p>{short(resolution.diagnosis, 220) || "没有可用证据，因此没有给出诊断。"}</p>
+        </>
+      ),
+    },
+    {
+      key: "risk",
+      title: "Risk Gate 风险门禁",
+      state: risk.decision ? "done" : "todo",
+      detail: (
+        <>
+          <Status value={risk.decision} /> · {risk.rule_id || "-"} · executable=
+          {String(Boolean(risk.executable))} · 工具 {risk.tool_name || "-"}
+          <ul className="it-list">
+            {(risk.reasons || []).map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </>
+      ),
+    },
+    {
+      key: "approval",
+      title: "Approval 人工审批",
+      // Three states, not two: no approval needed, one waiting, one decided.
+      state: approval ? (approval.status === "pending" ? "waiting" : "done") : "done",
+      detail: approval ? (
+        <>
+          <Status value={approval.status} /> · {approval.action_type} · 工具 {approval.tool_name || "-"}
+          {approval.decided_by ? ` · 决策人 ${approval.decided_by}` : ""}
+          {approval.reason ? <p className="muted">{approval.reason}</p> : null}
+          {approval.status === "pending" ? (
+            <div className="approval-actions">
+              <IconButton
+                icon={Check}
+                label={busy === `decide:${approval.id}` ? "提交中" : "批准执行"}
+                disabled={!canDecide || Boolean(busy)}
+                onClick={() => onDecide(approval.id, true)}
+              />
+              <IconButton
+                icon={X}
+                label="拒绝"
+                variant="danger"
+                disabled={!canDecide || Boolean(busy)}
+                onClick={() => onDecide(approval.id, false)}
+              />
+            </div>
+          ) : null}
+          {approval.status === "pending" && !canDecide ? (
+            <p className="muted">当前账号角色为 {role}，无权审批；请以 manager / admin 身份登录。</p>
+          ) : null}
+        </>
+      ) : (
+        <p className="muted">风控判定为自动执行，无需人工审批。</p>
+      ),
+    },
+    {
+      key: "tool",
+      title: "Tool Execution 工具执行",
+      state: execution?.executed ? "done" : approval?.status === "pending" ? "waiting" : "todo",
+      // Four distinct answers, not two. "Nothing ran because a human has not
+      // decided yet" and "nothing ran because there was nothing runnable" look
+      // identical if you only test ``executed``, and they mean opposite things
+      // to whoever is reading the ticket.
+      detail: execution?.executed ? (
+        <>
+          <Status value="executed" /> · {execution.tool_name} · {execution.arguments?.asset_id || execution.target || "-"} ·
+          执行账号 {execution.executed_by || "-"} · 请求人 {execution.requested_by || "-"}
+        </>
+      ) : approval?.status === "pending" ? (
+        <>
+          <Status value="not_yet" />
+          <p>等待人工审批，尚未执行任何工具。</p>
+        </>
+      ) : approval?.status === "denied" ? (
+        <>
+          <Status value="not_executed" />
+          <p>审批被拒绝：{execution?.reason || "approval_denied"}，未执行任何工具。</p>
+        </>
+      ) : risk.decision === "deny" ? (
+        <>
+          <Status value="not_executed" />
+          <p>风险门禁拒绝：{execution?.reason || "risk_deny"}，未执行任何工具。</p>
+        </>
+      ) : (
+        <>
+          <Status value="not_executed" />
+          <p>未执行：{execution?.reason || "no_action"}（没有可执行的工具动作，不编造解决方案）。</p>
+        </>
+      ),
+    },
+    {
+      key: "audit",
+      title: "Final Status 与审计链",
+      state: ["resolved", "rejected", "closed"].includes(ticket.status) ? "done" : "waiting",
+      detail: (
+        <>
+          <Status value={ticket.status} />
+          <ol className="it-audit">
+            {(chain.audit || []).map((row) => (
+              <li key={row.id}>
+                <code>{row.event_type}</code>
+                <span className="muted">
+                  {row.actor} · {(row.created_at || "").slice(11, 19)}
+                </span>
+              </li>
+            ))}
+          </ol>
+          <IconButton icon={RefreshCw} label="刷新链路" variant="ghost" onClick={onRefresh} />
+        </>
+      ),
+    },
+  ];
+
+  // The same ``.progress-step`` markup and styling as ``ProgressTimeline``, but
+  // rendered here rather than through it: that component wraps each detail in a
+  // ``<p>``, and these details contain lists and blocks. A ``<div>`` inside a
+  // ``<p>`` is invalid HTML that the browser silently restructures, which would
+  // have looked like a styling bug rather than the markup error it is.
+  return (
+    <div className="progress-timeline it-timeline">
+      {steps.map((step, index) => (
+        <div className={`progress-step ${step.state}`} key={step.key}>
+          <span className="progress-index">{index + 1}</span>
+          <div className="it-step">
+            <strong>{step.title}</strong>
+            <div className="it-step-detail">{step.detail}</div>
+          </div>
+        </div>
+      ))}
+      <ITEvidenceNote />
+    </div>
+  );
+}
+
+function ITEvidenceList({ tone, items, empty }) {
+  if (!items.length) return <p className="muted">{empty}</p>;
+  return (
+    <ul className={`it-evidence ${tone}`}>
+      {items.map((item) => (
+        <li key={item.key}>
+          <strong>{item.title}</strong>
+          <span className="muted">{item.meta}</span>
+          {item.body ? <p>{short(item.body, 200)}</p> : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function ITEvidenceNote() {
+  // §六's separation, stated where a reader of the UI will actually meet it.
+  return (
+    <p className="it-evidence-note">
+      正式知识（政策 / Runbook）是执行依据；历史工单只是过去的处理经验，仅作参考，不构成政策，也不会被用来选择动作。
+    </p>
+  );
 }
 
 function extractWorkflowArtifacts(workflow) {

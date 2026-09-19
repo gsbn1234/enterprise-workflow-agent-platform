@@ -53,6 +53,38 @@ jobs:
       - name: RAG tool integration smoke
         run: python scripts/rag_tool_smoke_test.py
 
+      - name: IT request triage smoke
+        run: python scripts/it_triage_smoke_test.py
+
+      - name: IT intake smoke
+        run: python scripts/it_smoke_test.py
+
+      - name: IT tool RBAC smoke
+        run: python scripts/it_rbac_smoke_test.py
+
+      - name: IT resolution loop smoke
+        run: python scripts/it_resolution_smoke_test.py
+
+      - name: Historical ticket retrieval smoke
+        run: python scripts/it_history_smoke_test.py
+
+      - name: IT evaluation harness smoke
+        run: python scripts/it_evaluation_smoke_test.py
+
+      - name: IT Phase 4 regression smoke
+        # The three defects Phase 3's evaluation surfaced, as one case each:
+        # production/critical asset metadata reaching the risk gate, service
+        # classification not following keyword order, and the two readings of
+        # "授权". Reverting any of the three fixes turns a case here red.
+        run: python scripts/it_regression_smoke_test.py
+
+      - name: IT incident evaluation suite
+        # One case still fails, on retrieval alone (see the Phase 4 report's
+        # known limitations); everything else in the suite is green and the
+        # suite reports its own numbers either way. It is an evaluation, not a
+        # gate, so it exits 0 and the numbers are read.
+        run: python scripts/evaluate.py --suite it
+
       - name: MCP-style tool service smoke
         run: python scripts/mcp_smoke_test.py
 

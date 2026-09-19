@@ -1818,3 +1818,195 @@ button:focus-visible {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   IT 服务面板（Phase 3）
+
+   整块都是新增：Workspace 主列里的一个 Card，内含输入框与九步链路。
+   链路复用 .progress-timeline / .progress-step 的既有视觉语言，只把网格
+   从六列改成单列纵向；正式知识与历史工单用两种不同的强调色区分，让 §六 的
+   两类证据分离在 UI 上直接可见，而不是只活在字段名里。
+--------------------------------------------------------------------------- */
+
+.it-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.it-panel-input {
+  display: grid;
+  gap: 8px;
+}
+
+.it-panel-input textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.it-panel-input textarea:focus {
+  outline: 2px solid var(--blue);
+  outline-offset: 1px;
+  background: #fff;
+}
+
+.it-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.it-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 9px 11px;
+  font-size: 13px;
+}
+
+.it-note.pending,
+.it-note.waiting_approval {
+  border-left-color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.it-note.failed {
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.it-note.approved {
+  border-left-color: var(--ok);
+  background: var(--ok-soft);
+}
+
+.it-timeline {
+  grid-template-columns: 1fr;
+}
+
+.it-step {
+  min-width: 0;
+}
+
+.it-step-detail {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.it-step-detail p {
+  margin: 4px 0 0;
+}
+
+.it-step-detail code {
+  font-size: 11px;
+}
+
+.it-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.it-badge {
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  background: #fff;
+}
+
+.it-badge.warn {
+  border-color: #fedf89;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-weight: 700;
+}
+
+.it-evidence {
+  display: grid;
+  gap: 6px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.it-evidence li {
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: #fff;
+  padding: 7px 9px;
+}
+
+/* 正式知识：可执行依据 */
+.it-evidence.knowledge li {
+  border-left-color: var(--blue);
+}
+
+/* 历史工单：仅供参考，永不作为政策 */
+.it-evidence.historical li {
+  border-left-color: var(--warn);
+  background: repeating-linear-gradient(135deg, #fffdf5, #fffdf5 8px, #fff9e8 8px, #fff9e8 16px);
+}
+
+.it-evidence li strong {
+  display: block;
+  font-size: 12px;
+}
+
+.it-evidence li span {
+  display: block;
+  font-size: 11px;
+}
+
+.it-evidence li p {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.it-list {
+  margin: 4px 0 0;
+  padding-left: 16px;
+}
+
+.it-audit {
+  margin: 6px 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 3px;
+}
+
+.it-audit li {
+  font-size: 11.5px;
+}
+
+.it-audit li span {
+  margin-left: 6px;
+}
+
+.it-evidence-note {
+  margin: 8px 0 0;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface-soft);
+}

@@ -13,6 +13,7 @@ from app.config import settings
 from app.db import get_connection
 from app.services.audit import record_audit
 from app.services.auth import AuthContext, AuthError, create_access_token, public_user
+from app.services.it.rbac import KNOWN_ROLES
 from app.services.tenancy import effective_tenant_id
 from app.utils import utc_now
 
@@ -334,7 +335,7 @@ def _claim(claims: dict[str, Any], claim_name: str) -> Any:
 
 def _role_from_claims(claims: dict[str, Any]) -> str:
     explicit = str(_claim(claims, settings.oidc_role_claim) or "").strip().lower()
-    if explicit in {"admin", "manager", "employee"}:
+    if explicit in KNOWN_ROLES:
         return explicit
     groups = _claim(claims, settings.oidc_groups_claim) or []
     if isinstance(groups, str):
@@ -345,7 +346,7 @@ def _role_from_claims(claims: dict[str, Any]) -> str:
     if normalized.intersection({group.lower() for group in settings.oidc_manager_groups}):
         return "manager"
     default = settings.oidc_default_role.strip().lower()
-    return default if default in {"admin", "manager", "employee"} else "employee"
+    return default if default in KNOWN_ROLES else "employee"
 
 
 def _external_user_id(issuer: str, subject: str) -> str:

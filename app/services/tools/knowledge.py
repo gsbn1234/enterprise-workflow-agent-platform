@@ -211,6 +211,16 @@ def _extract_terms(query: str) -> set[str]:
         "赔偿",
         "外部",
         "隐私",
+        # IT operations vocabulary. The IT corpus and the incidents filed
+        # against it are written in Chinese, while the seeded article tags are
+        # ASCII — without these, a report like "缓存压力很大，需要清理" extracts
+        # no term at all and retrieves nothing. Kept to words absent from the
+        # business corpus so a business query cannot pull in an IT article.
+        "缓存",
+        "清理",
+        "重启",
+        "服务器",
+        "数据库",
     ]
     for term in business_terms:
         if term in query:

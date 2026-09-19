@@ -13,16 +13,19 @@ from langgraph.types import Command, interrupt
 
 from app.config import settings
 from app.db import get_connection, row_to_dict, rows_to_dicts
+from app.services.agent import get_run_detail
 from app.services.audit import record_audit
 from app.services.multi_agent.agents import (
     ComplianceRiskAgent,
     CorrectionAgent,
     CriticAgent,
     EnterpriseRagResearchAgent,
+    HistoricalTicketResearchAgent,
     LocalPolicyResearchAgent,
     MemoryAgent,
     OperationalRiskAgent,
     RagResearchAgent,
+    ResolutionAgent,
     RiskApprovalAgent,
     SupervisorAgent,
     ToolExecutionAgent,
@@ -35,8 +38,24 @@ from app.services.multi_agent.coordination import (
     register_task_graph,
     start_task,
 )
+from app.services.it.execution import (
+    execute_it_action,
+    find_approved_approval_id,
+    find_denied_approval_id,
+    it_action_arguments,
+    record_it_action_skipped,
+)
+from app.services.auth import AuthContext
+from app.services.it.risk_gate import ACTION_CLASSES as IT_ACTION_CLASSES
+from app.services.it.risk_gate import DECISION_DENY, DECISION_REQUIRE_APPROVAL
+from app.services.it.risk_gate import UNKNOWN_CRITICALITY, UNKNOWN_ENVIRONMENT
+from app.services.it.risk_gate import evaluate as evaluate_it_risk
+from app.services.it.risk_gate import merge_criticality, merge_environment
+from app.services.it.triage import classify as classify_it_request
 from app.services.tenancy import effective_tenant_id
-from app.utils import json_dumps, json_loads, new_id, utc_now
+from app.services.tools.registry import call_tool
+from app.services.tools.ticketing import update_ticket
+from app.utils import compact_text, json_dumps, json_loads, new_id, utc_now
 
 
 class MultiAgentState(TypedDict, total=False):
@@ -65,6 +84,19 @@ class MultiAgentState(TypedDict, total=False):
     self_correction_report: dict
     memory_item: dict
     final_summary: str
+    # IT service loop (Phase 2). ``it_ticket_id`` is both the ticket linkage and
+    # the mode switch: it is only present on runs started for an IT ticket, and
+    # the IT nodes return an empty update without it, so a non-IT run's
+    # state dictionary is byte-for-byte what it was before.
+    it_ticket_id: str
+    it_triage: dict
+    it_research_query: str
+    # Phase 3's second evidence channel. A sibling of ``research_output``, never
+    # folded into it: the resolver takes both and may only act on one.
+    it_history: dict
+    it_resolution: dict
+    it_risk_decision: dict
+    it_execution: dict
 
 
 _checkpoint_lock = threading.Lock()
@@ -88,6 +120,7 @@ def run_multi_agent_durable(
     max_correction_attempts: int = 1,
     replay_of_run_id: str | None = None,
     diagnostic_force_critic_failure: bool = False,
+    it_ticket_id: str | None = None,
 ) -> dict:
     started = time.perf_counter()
     run_id = new_id("ma")
@@ -98,8 +131,8 @@ def run_multi_agent_durable(
             """
             INSERT INTO multi_agent_runs
             (id, objective, requester_user_id, requester_department, requester_role, tenant_id, status,
-             executor_type, thread_id, correction_count, replay_of_run_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'running', 'durable_langgraph', ?, 0, ?, ?)
+             executor_type, thread_id, correction_count, replay_of_run_id, it_ticket_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'running', 'durable_langgraph', ?, 0, ?, ?, ?)
             """,
             (
                 run_id,
@@ -110,6 +143,7 @@ def run_multi_agent_durable(
                 tenant,
                 thread_id,
                 replay_of_run_id,
+                it_ticket_id,
                 utc_now(),
             ),
         )
@@ -140,6 +174,11 @@ def run_multi_agent_durable(
         "enable_self_correction": enable_self_correction,
         "diagnostic_force_critic_failure": diagnostic_force_critic_failure,
     }
+    if it_ticket_id:
+        # Inserted only when set, so every pre-existing run keeps the exact
+        # state dictionary — and therefore the exact checkpoint payload — it
+        # had before this key existed.
+        initial_state["it_ticket_id"] = it_ticket_id
 
     try:
         final_state = graph.invoke(initial_state, {"configurable": {"thread_id": thread_id}})
@@ -246,16 +285,20 @@ def resume_multi_agent_for_workflow(workflow: dict) -> dict | None:
 def _build_graph(context: DurableRunContext):
     builder = StateGraph(MultiAgentState)
     builder.add_node("memory_retrieve", lambda state: _memory_retrieve_node(state, context))
+    builder.add_node("it_triage", lambda state: _it_triage_node(state, context))
     builder.add_node("supervisor", lambda state: _supervisor_node(state, context))
     builder.add_node("research_dispatch", lambda state: _research_dispatch_node(state, context))
     builder.add_node("research_bypass", lambda state: _research_bypass_node(state, context))
     builder.add_node("enterprise_rag_research", lambda state: _enterprise_rag_research_node(state, context))
     builder.add_node("local_policy_research", lambda state: _local_policy_research_node(state, context))
     builder.add_node("evidence_synthesis", lambda state: _evidence_synthesis_node(state, context))
+    builder.add_node("it_history", lambda state: _it_history_node(state, context))
+    builder.add_node("it_resolution", lambda state: _it_resolution_node(state, context))
     builder.add_node("risk_dispatch", lambda state: _risk_dispatch_node(state, context))
     builder.add_node("compliance_risk", lambda state: _compliance_risk_node(state, context))
     builder.add_node("operational_risk", lambda state: _operational_risk_node(state, context))
     builder.add_node("risk_consensus", lambda state: _risk_consensus_node(state, context))
+    builder.add_node("risk_gate", lambda state: _risk_gate_node(state, context))
     builder.add_node("tool_execution", lambda state: _tool_execution_node(state, context))
     builder.add_node("human_approval", lambda state: _human_approval_node(state, context))
     builder.add_node("critic", lambda state: _critic_node(state, context))
@@ -264,7 +307,11 @@ def _build_graph(context: DurableRunContext):
     builder.add_node("finalize", lambda state: _finalize_node(state, context))
 
     builder.add_edge(START, "memory_retrieve")
-    builder.add_edge("memory_retrieve", "supervisor")
+    # IT triage sits between memory and planning: it is the only place the IT
+    # ticket is read, and it hands the planner an objective enriched with the
+    # classified entities so the retrieval nodes below can match the corpus.
+    builder.add_edge("memory_retrieve", "it_triage")
+    builder.add_edge("it_triage", "supervisor")
     builder.add_conditional_edges(
         "supervisor",
         _route_research,
@@ -273,12 +320,18 @@ def _build_graph(context: DurableRunContext):
     builder.add_edge("research_dispatch", "enterprise_rag_research")
     builder.add_edge("research_dispatch", "local_policy_research")
     builder.add_edge(["enterprise_rag_research", "local_policy_research"], "evidence_synthesis")
-    builder.add_edge("evidence_synthesis", "risk_dispatch")
-    builder.add_edge("research_bypass", "risk_dispatch")
+    builder.add_edge("evidence_synthesis", "it_history")
+    builder.add_edge("research_bypass", "it_history")
+    builder.add_edge("it_history", "it_resolution")
+    builder.add_edge("it_resolution", "risk_dispatch")
     builder.add_edge("risk_dispatch", "compliance_risk")
     builder.add_edge("risk_dispatch", "operational_risk")
     builder.add_edge(["compliance_risk", "operational_risk"], "risk_consensus")
-    builder.add_edge("risk_consensus", "tool_execution")
+    # The deterministic gate runs after the LLM risk agents, never instead of
+    # them: the votes stay exactly as they were and the gate is what the
+    # executor actually obeys.
+    builder.add_edge("risk_consensus", "risk_gate")
+    builder.add_edge("risk_gate", "tool_execution")
     builder.add_conditional_edges(
         "tool_execution",
         _route_after_execution,
@@ -314,6 +367,127 @@ def _memory_retrieve_node(state: MultiAgentState, context: DurableRunContext) ->
     update = {"memory_context": content}
     _record_checkpoint(context, "memory_retrieve", {**state, **update})
     return update
+
+
+def _it_triage_node(state: MultiAgentState, context: DurableRunContext) -> dict:
+    """Classify the IT request and derive the query the research nodes will use.
+
+    The classifier is the Phase 1 deterministic one, reused rather than
+    rewritten, and the ticket wins over a fresh classification: Phase 1 already
+    classified this request when the reporter filed it, and a re-worded
+    objective must not silently reclassify a live incident.
+
+    The entity-augmented query built here is the only reason the retrieval
+    nodes below can match an IT corpus at all — the reporter's own sentence
+    ("我的生产 Redis 连不上了") carries the words, but the *codes* the corpus is
+    tagged with (``REDIS``, ``production``) come from the classifier.
+    """
+    ticket_id = str(state.get("it_ticket_id") or "")
+    if not ticket_id:
+        # Not an IT run: no message, no task, no checkpoint, no audit. The
+        # state stays exactly as it was, which is what keeps every pre-existing
+        # trace and checkpoint payload identical.
+        return {}
+    objective = state.get("active_objective") or state["objective"]
+    attempt = int(state.get("correction_attempts", 0))
+    tenant_id = state.get("tenant_id")
+    actor = state.get("requester_user_id") or "agent"
+
+    def _triage() -> dict:
+        fresh = classify_it_request(objective).to_dict()
+        ticket = _it_ticket(state, ticket_id)
+        stored = dict(ticket.get("triage") or {})
+        triage = {**fresh, **stored} if stored else fresh
+        entities = dict(triage.get("entities") or {})
+        query = _it_research_query(objective, entities)
+        source = "phase1_stored" if stored else "recomputed"
+        record_audit(
+            "it.triage_classified",
+            "ticket",
+            ticket_id,
+            {
+                "intent": triage.get("intent"),
+                "category": triage.get("category"),
+                "priority": triage.get("priority"),
+                "entities": entities,
+                "needs_approval": bool(triage.get("needs_approval")),
+                "missing_information": list(triage.get("missing_information") or []),
+                "confidence": triage.get("confidence"),
+                "mode": triage.get("mode"),
+                "source": source,
+            },
+            actor=actor,
+            tenant_id=tenant_id,
+        )
+        record_audit(
+            "it.research_query_built",
+            "ticket",
+            ticket_id,
+            {
+                "query": query,
+                "entities": entities,
+                "objective_length": len(objective),
+            },
+            actor=actor,
+            tenant_id=tenant_id,
+        )
+        return {
+            **triage,
+            "ticket_id": ticket_id,
+            "ticket_status": ticket.get("status"),
+            "asset_id": ticket.get("asset_id"),
+            "it_category": ticket.get("it_category"),
+            "environment": ticket.get("environment") or entities.get("environment"),
+            "research_query": query,
+            "source": source,
+            "producer": "it_triage",
+        }
+
+    content = _run_agent_message(
+        context.run_id,
+        "it_triage",
+        "it_intake",
+        _triage,
+        task_key="it.triage",
+        task_attempt=attempt,
+        task_input={"ticket_id": ticket_id, "objective": objective},
+    )
+    update = {"it_triage": content, "it_research_query": content.get("research_query") or objective}
+    _record_checkpoint(context, "it_triage", {**state, **update})
+    return update
+
+
+def _it_research_query(objective: str, entities: dict) -> str:
+    """Append the classified entity codes the objective does not already say.
+
+    Order is preserved and the objective always leads, so a human reading the
+    audit row sees the reporter's words first and the added codes after.
+    """
+    parts = [objective]
+    for key in ("service", "resource", "software", "environment", "access_level"):
+        value = str(entities.get(key) or "").strip()
+        if value and value.lower() not in objective.lower():
+            parts.append(value)
+    return " ".join(dict.fromkeys(parts))[:400]
+
+
+def _it_ticket(state: MultiAgentState, ticket_id: str) -> dict:
+    """Read the IT ticket through the tool registry, never with a raw query.
+
+    ``query_tickets`` takes no ``auth_context``, so ``call_tool`` does not
+    inject one and the tenant scope has to be passed explicitly — without it
+    this read would cross tenants.
+    """
+    result = call_tool(
+        "query_tickets",
+        {"ticket_ref": ticket_id, "limit": 1, "tenant_id": state.get("tenant_id")},
+        actor=state.get("requester_user_id") or "agent",
+        source="multi_agent_it",
+    )
+    tickets = result.get("tickets") if isinstance(result, dict) else None
+    if isinstance(tickets, list) and tickets:
+        return dict(tickets[0])
+    return {}
 
 
 def _supervisor_node(state: MultiAgentState, context: DurableRunContext) -> dict:
@@ -458,6 +632,428 @@ def _evidence_synthesis_node(state: MultiAgentState, context: DurableRunContext)
     return update
 
 
+IT_HISTORY_LIMIT = 3
+"""§五's K: how many past tickets the resolution context is shown. Three keeps
+the historical channel a reference rather than a second corpus — past the top
+few, matches stop being comparable and start being noise."""
+
+
+def _it_history_node(state: MultiAgentState, context: DurableRunContext) -> dict:
+    """Retrieve how comparable past tickets were handled.
+
+    This is the second evidence channel and it is deliberately a *separate node
+    feeding a separate state key*. Nothing here is merged into
+    ``research_output``: the resolution agent receives the two channels under
+    two parameter names and only one of them can move the selected action. A
+    node that appended historical rows to the knowledge evidence would quietly
+    promote a past workaround to policy, which is precisely what the separation
+    exists to prevent.
+
+    Sits between synthesis and the resolution proposal, so it runs after the
+    knowledge channel is settled and before anything is decided. Like the other
+    three IT nodes it is a no-op with no side effects for non-IT runs.
+    """
+    ticket_id = str(state.get("it_ticket_id") or "")
+    if not ticket_id:
+        return {}
+    objective = state.get("active_objective") or state["objective"]
+    triage = state.get("it_triage") or {}
+    # Same query builder the triage node uses, so both channels search for the
+    # same thing. It is computed here rather than read from ``it_research_query``
+    # because nothing in the graph consumes that key today (see the Phase 3
+    # report); reusing the helper keeps the two in step regardless.
+    query = _it_research_query(objective, triage.get("entities") or {})
+    attempt = int(state.get("correction_attempts", 0))
+    tenant_id = state.get("tenant_id")
+    limit = IT_HISTORY_LIMIT
+
+    def _history() -> dict:
+        content = HistoricalTicketResearchAgent().run(
+            query, tenant_id=tenant_id, limit=limit
+        )
+        results = list(content.get("results") or [])
+        record_audit(
+            "it.historical_retrieved",
+            "ticket",
+            ticket_id,
+            {
+                "ticket_id": ticket_id,
+                "query": content.get("query"),
+                "terms": list(content.get("terms") or []),
+                "count": int(content.get("count") or 0),
+                "matched_count": int(content.get("matched_count") or 0),
+                "source": content.get("source"),
+                "mode": content.get("mode"),
+                "available": content.get("available"),
+                "reason": content.get("reason"),
+                # Only what an auditor needs to see *why* this ticket was cited:
+                # which ones, how close, and what was done at the time. The
+                # resolution text itself is in the ticket corpus, not here.
+                "top": [
+                    {
+                        "ticket_id": item.get("ticket_id"),
+                        "title": item.get("title"),
+                        "category": item.get("category"),
+                        "similarity": item.get("similarity"),
+                        "resolution_action": item.get("resolution_action"),
+                        "status": item.get("status"),
+                    }
+                    for item in results
+                ],
+            },
+            actor=state.get("requester_user_id") or "agent",
+            tenant_id=tenant_id,
+        )
+        return content
+
+    content = _run_agent_message(
+        context.run_id,
+        HistoricalTicketResearchAgent.name,
+        "it_historian",
+        _history,
+        task_key="it.history",
+        task_attempt=attempt,
+        task_input={"ticket_id": ticket_id, "query": query, "limit": limit},
+    )
+    record_handoff(
+        context.run_id,
+        HistoricalTicketResearchAgent.name,
+        "it_history",
+        "it.resolution",
+        {"count": content.get("count"), "available": content.get("available")},
+    )
+    update = {"it_history": content}
+    _record_checkpoint(context, "it_history", {**state, **update})
+    return update
+
+
+def _it_resolution_node(state: MultiAgentState, context: DurableRunContext) -> dict:
+    """Ask the resolution agent to propose an action from the retrieved evidence.
+
+    The agent proposes; it never executes. Its output is the input to the
+    deterministic gate two nodes later, and everything that will actually run —
+    action class, tool, arguments — is read from the deterministic fields of
+    that output, never from the LLM-phrased ones.
+    """
+    ticket_id = str(state.get("it_ticket_id") or "")
+    if not ticket_id:
+        return {}
+    objective = state.get("active_objective") or state["objective"]
+    triage = state.get("it_triage") or {}
+    research_output = state.get("research_output") or {}
+    historical_output = state.get("it_history") or {}
+    attempt = int(state.get("correction_attempts", 0))
+    tenant_id = state.get("tenant_id")
+    actor = state.get("requester_user_id") or "agent"
+
+    def _resolve() -> dict:
+        ticket = _it_ticket(state, ticket_id)
+        content = ResolutionAgent().run(
+            objective,
+            triage=triage,
+            research_output=research_output,
+            ticket=ticket,
+            historical_output=historical_output,
+        )
+        content["ticket_id"] = ticket_id
+        common = {
+            "ticket_id": ticket_id,
+            "evidence_count": int(content.get("evidence_count") or 0),
+            "missing_information": list(content.get("missing_information") or []),
+            "mode": content.get("mode"),
+            # How much precedent was on hand is worth recording on both exits.
+            # ``historical_reference`` is the one that matters: true only when
+            # the history is standing in for knowledge that does not exist.
+            "historical_count": int(content.get("historical_count") or 0),
+            "historical_reference": bool(content.get("historical_reference")),
+        }
+        if content.get("status") == "NO_KNOWLEDGE":
+            # The audit row that proves nothing was invented: no diagnosis, no
+            # action, and the reason is the absence of evidence.
+            record_audit(
+                "it.resolution_no_knowledge",
+                "ticket",
+                ticket_id,
+                {
+                    **common,
+                    "warnings": list(content.get("warnings") or []),
+                    "route": content.get("route"),
+                    "reason": content.get("reason"),
+                },
+                actor=actor,
+                tenant_id=tenant_id,
+            )
+        else:
+            record_audit(
+                "it.resolution_proposed",
+                "ticket",
+                ticket_id,
+                {
+                    **common,
+                    "action_type": content.get("action_type"),
+                    "proposed_action": content.get("proposed_action"),
+                    "action_arguments": content.get("action_arguments"),
+                    "target": content.get("target"),
+                    "environment": content.get("environment"),
+                    "confidence": content.get("confidence"),
+                    "reason": content.get("reason"),
+                    # Knowledge evidence. Anything with a historical ``source``
+                    # in this list would be a bug: the resolver builds this from
+                    # the knowledge channel alone.
+                    "evidence": [
+                        {
+                            "article_id": item.get("article_id"),
+                            "title": item.get("title"),
+                            "source": item.get("source"),
+                            "score": item.get("score"),
+                            "snippet": compact_text(str(item.get("snippet") or ""), 240),
+                        }
+                        for item in (content.get("evidence") or [])
+                    ],
+                    "historical_divergence": bool(content.get("historical_divergence")),
+                    "historical_evidence": [
+                        {
+                            "ticket_id": item.get("ticket_id"),
+                            "title": item.get("title"),
+                            "resolution_action": item.get("resolution_action"),
+                            "similarity": item.get("similarity"),
+                            "snippet": compact_text(str(item.get("snippet") or ""), 240),
+                        }
+                        for item in (content.get("historical_evidence") or [])
+                    ],
+                },
+                actor=actor,
+                tenant_id=tenant_id,
+            )
+        return content
+
+    content = _run_agent_message(
+        context.run_id,
+        ResolutionAgent.name,
+        "it_resolver",
+        _resolve,
+        task_key="it.resolution",
+        task_attempt=attempt,
+        task_input={
+            "ticket_id": ticket_id,
+            "triage": triage,
+            "evidence_count": research_output.get("evidence_count"),
+        },
+    )
+    update = {"it_resolution": content}
+    _record_checkpoint(context, "it_resolution", {**state, **update})
+    return update
+
+
+def _it_asset_risk_metadata(state: MultiAgentState, resolution: dict) -> tuple[str, str, dict]:
+    """Read the target asset's own environment and criticality, fail-closed.
+
+    Phase 3's finding: the gate was told the environment by the *reporter* and
+    the criticality by the triage priority, and never once looked at the asset
+    the action was actually aimed at. A ticket saying "预发环境的 Redis 缓存需要
+    清理" therefore auto-executed a cache flush against REDIS-001, which the
+    asset table records as production and critical. The reporter's wording is a
+    claim; the asset row is the fact.
+
+    The read goes through ``call_tool`` like every other privileged access, so
+    the registry's role gate and the ``mcp.tool_*`` audit rows still apply and
+    an agent never reaches a Python function directly. ``get_asset`` redacts
+    ``serial``/``owner_user_id``/``metadata`` on production assets but never
+    ``environment`` or ``criticality`` — the two fields this needs.
+
+    Returns the pair to merge plus the provenance for the audit row. Anything
+    that stops the read — no asset id on the ticket, no such row, a refused
+    call, an unexpected error — yields the fail-closed defaults, because "we
+    could not verify this target" must not be the cheap way past the gate.
+    """
+    arguments = resolution.get("action_arguments")
+    arguments = arguments if isinstance(arguments, dict) else {}
+    triage = state.get("it_triage") or {}
+    # The action's own target first (what will actually be mutated), then the
+    # asset the ticket was filed against. A permission grant carries no asset id
+    # in its arguments, so the ticket's binding is what is left.
+    asset_id = next(
+        (
+            text
+            for text in (
+                str(arguments.get("asset_id") or "").strip(),
+                str(triage.get("asset_id") or "").strip(),
+                str(resolution.get("target") or "").strip(),
+            )
+            if text
+        ),
+        None,
+    )
+    provenance: dict = {"asset_id": asset_id, "asset_lookup": "no_asset_id"}
+    if not asset_id:
+        return UNKNOWN_ENVIRONMENT, UNKNOWN_CRITICALITY, provenance
+
+    requester = str(state.get("requester_user_id") or "agent")
+    auth_context = AuthContext(
+        user_id=requester,
+        display_name=requester,
+        department=str(state.get("requester_department") or ""),
+        role=str(state.get("requester_role") or "employee"),
+        tenant_id=str(state.get("tenant_id") or effective_tenant_id(None)),
+    )
+    try:
+        # No tenant argument: ``get_asset`` scopes itself with the ambient
+        # tenancy context, exactly as intake's ``find_asset_by_type`` does.
+        result = call_tool(
+            "get_asset",
+            {"asset_id": asset_id},
+            actor=requester,
+            source="multi_agent_it",
+            auth_context=auth_context,
+        )
+    except Exception:  # pragma: no cover - a read that raises is still a read we did not get
+        provenance["asset_lookup"] = "error"
+        return UNKNOWN_ENVIRONMENT, UNKNOWN_CRITICALITY, provenance
+
+    if not isinstance(result, dict) or result.get("error"):
+        # "forbidden" is the registry's role gate refusing the read; anything
+        # else is the tool itself failing. Both fail closed, but the audit row
+        # keeps them apart so "why" stays answerable.
+        error = str((result or {}).get("error") or "")
+        provenance["asset_lookup"] = "denied" if error == "forbidden" else "error"
+        provenance["asset_lookup_reason"] = str((result or {}).get("reason") or error)
+        return UNKNOWN_ENVIRONMENT, UNKNOWN_CRITICALITY, provenance
+    if not result.get("found"):
+        provenance["asset_lookup"] = "not_found"
+        return UNKNOWN_ENVIRONMENT, UNKNOWN_CRITICALITY, provenance
+
+    asset = result.get("asset") or {}
+    provenance["asset_lookup"] = "found"
+    return (
+        str(asset.get("environment") or "") or UNKNOWN_ENVIRONMENT,
+        str(asset.get("criticality") or "") or UNKNOWN_CRITICALITY,
+        provenance,
+    )
+
+
+def _risk_gate_node(state: MultiAgentState, context: DurableRunContext) -> dict:
+    """Apply the deterministic risk gate and attach the plan the executor obeys.
+
+    This node is the boundary between "the agents think" and "the platform
+    does". Everything downstream — the approval, the tool call — reads the
+    decision recorded here.
+
+    Three things are deliberately *not* taken from the model:
+
+    * ``environment`` and ``criticality``. Both are merged from the target
+      asset's own metadata and from what the ticket says, and the **most
+      severe** of the two wins (see :func:`_it_asset_risk_metadata`). The merge
+      is ordinary Python that runs before the gate is called, so nothing a model
+      produces can reach it — and because it takes the maximum, no source can
+      argue the decision downwards, only upwards.
+    * ``confidence`` is passed to the gate only so the gate can echo it into
+      the audit row beside ``llm_confidence_used: False``. No branch of the gate
+      reads it.
+    """
+    ticket_id = str(state.get("it_ticket_id") or "")
+    if not ticket_id:
+        return {}
+    resolution = state.get("it_resolution") or {}
+    triage = state.get("it_triage") or {}
+    asset_environment, asset_criticality, provenance = _it_asset_risk_metadata(state, resolution)
+    text_environment = resolution.get("environment")
+    text_criticality = "critical" if triage.get("priority") == "urgent" else None
+    decision = evaluate_it_risk(
+        action_type=resolution.get("action_type"),
+        environment=merge_environment(asset_environment, text_environment),
+        criticality=merge_criticality(asset_criticality, text_criticality),
+        triage_needs_approval=bool(triage.get("needs_approval")),
+        evidence_count=int(resolution.get("evidence_count") or 0),
+        missing_information=resolution.get("missing_information") or (),
+        llm_confidence=resolution.get("confidence"),
+        actor_role=state.get("requester_role"),
+    ).to_dict()
+    action_class = IT_ACTION_CLASSES.get(str(decision["action_type"] or ""))
+    record_audit(
+        "it.risk_gate_decided",
+        "ticket",
+        ticket_id,
+        {
+            "action_type": decision["action_type"],
+            "risk_class": decision["risk_class"],
+            "decision": decision["decision"],
+            "executable": decision["executable"],
+            "rule_id": decision["rule_id"],
+            "reasons": decision["reasons"],
+            "inputs": decision["inputs"],
+            "llm_confidence": decision["llm_confidence"],
+            "llm_confidence_used": decision["llm_confidence_used"],
+            "mode": decision["mode"],
+            "resolution_status": resolution.get("status"),
+            # Requirement 十二: "why did the gate ask for approval?" answered
+            # from this row alone — which asset, how bad it is, what kind of
+            # action, and where each of the two facts came from.
+            **provenance,
+            "environment": decision["environment"],
+            "criticality": decision["inputs"]["criticality"],
+            "tool_name": decision["tool_name"],
+            "action_class": action_class.to_dict() if action_class else None,
+            "asset_environment": asset_environment,
+            "asset_criticality": asset_criticality,
+            "text_environment": text_environment,
+            "text_criticality": text_criticality,
+        },
+        actor=state.get("requester_user_id") or "agent",
+        tenant_id=state.get("tenant_id"),
+    )
+    # The gate, not the resolution node, owns the plan the executor reads: the
+    # resolution ran before the decision existed and cannot know it.
+    supervisor_output = dict(state.get("supervisor_output") or {})
+    plan = dict(supervisor_output.get("plan") or {})
+    plan.update(
+        {
+            "approval_action": resolution.get("action_type"),
+            "approval_tool": decision["tool_name"] or "human_handoff",
+            "final_ticket_status": "approved",
+            "needs_approval": decision["decision"] == DECISION_REQUIRE_APPROVAL,
+            "it_action_type": resolution.get("action_type"),
+            "it_risk_rule_id": decision["rule_id"],
+        }
+    )
+    supervisor_output["plan"] = plan
+    update = {
+        "it_risk_decision": decision,
+        "supervisor_output": supervisor_output,
+    }
+    _record_checkpoint(context, "risk_gate", {**state, **update})
+    return update
+
+
+def _it_action_payload(state: MultiAgentState, context: DurableRunContext) -> dict | None:
+    """The envelope ``run_workflow`` needs to carry out the gate's decision.
+
+    Rebuilt from the two checkpointed dictionaries rather than stored as a third
+    copy of the same facts, so there is no way for the decision and the action it
+    authorises to drift apart.
+    """
+    ticket_id = str(state.get("it_ticket_id") or "")
+    if not ticket_id:
+        return None
+    resolution = state.get("it_resolution") or {}
+    decision = state.get("it_risk_decision") or {}
+    if not decision:
+        return None
+    return {
+        "ticket_id": ticket_id,
+        "action_type": resolution.get("action_type"),
+        "tool_name": decision.get("tool_name"),
+        "arguments": it_action_arguments(resolution),
+        "risk_decision": decision,
+        "resolution": resolution,
+        "requested_by": state.get("requester_user_id"),
+        "multi_agent_run_id": context.run_id,
+        # Carried so a second trip through the execution branch — the
+        # correction loop can route back here — short-circuits instead of
+        # running the same restart twice.
+        "prior_execution": dict(state.get("it_execution") or {}),
+    }
+
+
 def _risk_dispatch_node(state: MultiAgentState, context: DurableRunContext) -> dict:
     source_agent = str(state.get("research_output", {}).get("producer") or "rag_research")
     record_handoff(
@@ -558,6 +1154,7 @@ def _tool_execution_node(state: MultiAgentState, context: DurableRunContext) -> 
             supervisor_output=state.get("supervisor_output"),
             research_output=state.get("research_output"),
             risk_output=state.get("risk_output"),
+            it_action=_it_action_payload(state, context),
         ),
         task_key="action.execute",
         task_attempt=attempt,
@@ -565,6 +1162,7 @@ def _tool_execution_node(state: MultiAgentState, context: DurableRunContext) -> 
             "plan": state.get("supervisor_output", {}).get("plan"),
             "research_handoff": state.get("research_output"),
             "risk_consensus": state.get("risk_output"),
+            "it_ticket_id": state.get("it_ticket_id"),
         },
     )
     next_agent = "human_approval" if content.get("workflow_status") == "waiting_approval" else "critic"
@@ -580,8 +1178,30 @@ def _tool_execution_node(state: MultiAgentState, context: DurableRunContext) -> 
         },
     )
     update = {"execution_output": content}
+    if state.get("it_ticket_id"):
+        # run_workflow performed the action, and its result lives only on the
+        # workflow step. Lifting it into the graph state is what lets the API
+        # report what happened for an automatically cleared action, and what
+        # stops the correction loop from running it a second time.
+        recorded = _it_execution_from_step(content.get("workflow_run_id"))
+        if recorded is not None:
+            update["it_execution"] = recorded
     _record_checkpoint(context, "tool_execution", {**state, **update})
     return update
+
+
+def _it_execution_from_step(workflow_run_id: str | None) -> dict | None:
+    """The IT execution result recorded on this workflow run, if there was one."""
+    if not workflow_run_id:
+        return None
+    workflow = get_run_detail(workflow_run_id) or {}
+    for step in workflow.get("steps", []):
+        if step.get("action_type") != "it_operation":
+            continue
+        output = step.get("tool_output")
+        if isinstance(output, dict) and "executed" in output:
+            return output
+    return None
 
 
 def _human_approval_node(state: MultiAgentState, context: DurableRunContext) -> dict:
@@ -617,8 +1237,94 @@ def _human_approval_node(state: MultiAgentState, context: DurableRunContext) -> 
         {"workflow_run_id": workflow.get("id"), "workflow_status": workflow.get("status")},
     )
     update = {"execution_output": content}
+    if state.get("it_ticket_id"):
+        # summarize_workflow above replaces execution_output wholesale and
+        # carries no IT action, so the approved action would otherwise never
+        # run. It runs here, after the human decided, and never before.
+        update["it_execution"] = _execute_it_action_after_approval(state, context, workflow)
     _record_checkpoint(context, "human_approval", {**state, **update})
     return update
+
+
+def _execute_it_action_after_approval(
+    state: MultiAgentState, context: DurableRunContext, workflow: dict
+) -> dict:
+    """Run the IT action a human just approved — once, and only if it is runnable."""
+    ticket_id = str(state.get("it_ticket_id") or "")
+    resolution = state.get("it_resolution") or {}
+    decision = state.get("it_risk_decision") or {}
+    action_type = resolution.get("action_type")
+    tool_name = decision.get("tool_name")
+    requested_by = state.get("requester_user_id")
+    workflow_run_id = str(workflow.get("id") or "")
+    tenant_id = state.get("tenant_id")
+
+    prior = state.get("it_execution") or {}
+    if prior.get("executed"):
+        # A second trip through this node must not become a second outage
+        # window. The correction loop can route back here; the execution cannot
+        # be repeated.
+        return {**prior, "reason": "already_executed"}
+
+    if str(workflow.get("status") or "") != "completed":
+        # The reviewer declined. The workflow already rejected the ticket; all
+        # that is left is to record that nothing ran, and why.
+        record_it_action_skipped(
+            ticket_id=ticket_id,
+            action_type=action_type,
+            tool_name=tool_name,
+            reason="approval_denied",
+            risk_decision=decision,
+            approval_id=find_denied_approval_id(workflow_run_id),
+            requested_by=requested_by,
+            workflow_run_id=workflow_run_id,
+            multi_agent_run_id=context.run_id,
+        )
+        return {"executed": False, "reason": "approval_denied", "ticket_id": ticket_id}
+
+    execution = execute_it_action(
+        ticket_id=ticket_id,
+        action_type=action_type,
+        tool_name=tool_name,
+        arguments=it_action_arguments(resolution),
+        risk_decision=decision,
+        approval_id=find_approved_approval_id(workflow_run_id),
+        requested_by=requested_by,
+        workflow_run_id=workflow_run_id,
+        multi_agent_run_id=context.run_id,
+        prior_execution=prior,
+    )
+    ticket_status = "resolved" if execution.get("executed") else "investigating"
+    comment = (
+        "IT action executed after human approval; ticket resolved."
+        if execution.get("executed")
+        else (
+            "Approved for human handling, not for execution "
+            f"({execution.get('reason')}); the ticket is back with a human owner."
+        )
+    )
+    _sync_it_ticket(ticket_id, ticket_status, comment, tenant_id, workflow_run_id, requested_by)
+    return execution
+
+
+def _sync_it_ticket(
+    ticket_id: str,
+    status: str,
+    comment: str,
+    tenant_id: str | None,
+    workflow_run_id: str,
+    actor: str | None,
+) -> None:
+    if not ticket_id:
+        return
+    update_ticket(
+        ticket_id,
+        status=status,
+        comment=comment,
+        actor=actor or "agent",
+        agent_run_id=workflow_run_id,
+        tenant_id=tenant_id,
+    )
 
 
 def _critic_node(state: MultiAgentState, context: DurableRunContext) -> dict:
@@ -632,6 +1338,7 @@ def _critic_node(state: MultiAgentState, context: DurableRunContext) -> dict:
             state["execution_output"]["workflow_run_id"],
             state["supervisor_output"],
             state.get("risk_output"),
+            it_context=_it_critic_context(state),
         ),
         task_key="quality.critic",
         task_attempt=attempt,
@@ -723,12 +1430,31 @@ def _finalize_node(state: MultiAgentState, context: DurableRunContext) -> dict:
     return update
 
 
+def _it_critic_context(state: MultiAgentState) -> dict | None:
+    """What the critic needs to judge an IT run, or None for a non-IT run."""
+    if not state.get("it_ticket_id"):
+        return None
+    decision = state.get("it_risk_decision") or {}
+    return {
+        "ticket_id": state.get("it_ticket_id"),
+        "decision": decision.get("decision"),
+        "tool_name": decision.get("tool_name"),
+        "rule_id": decision.get("rule_id"),
+        "executed": bool((state.get("it_execution") or {}).get("executed")),
+    }
+
+
 def _route_after_execution(state: MultiAgentState) -> str:
     status = state.get("execution_output", {}).get("workflow_status")
     return "human_approval" if status == "waiting_approval" else "critic"
 
 
 def _route_research(state: MultiAgentState) -> str:
+    # An IT resolution without retrieved evidence is not allowed to exist — the
+    # agent's own rule is "no evidence, no answer" — so an IT run always
+    # retrieves. Non-IT runs are unaffected.
+    if state.get("it_ticket_id"):
+        return "research_parallel"
     return "research_parallel" if state.get("supervisor_output", {}).get("research_required", True) else "research_bypass"
 
 
@@ -870,7 +1596,16 @@ def _checkpoint_state(state: dict) -> dict:
         "final_summary",
         "correction_attempts",
         "max_correction_attempts",
+        "it_ticket_id",
+        "it_triage",
+        "it_research_query",
+        "it_history",
+        "it_resolution",
+        "it_risk_decision",
+        "it_execution",
     ]
+    # ``if key in state`` keeps non-IT checkpoints byte-identical: the IT key is
+    # only ever present on a run that was started for an IT ticket.
     return {key: state.get(key) for key in keys if key in state}
 
 

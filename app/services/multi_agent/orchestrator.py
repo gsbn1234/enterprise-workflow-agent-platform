@@ -30,6 +30,7 @@ def run_multi_agent(
     max_correction_attempts: int = 1,
     replay_of_run_id: str | None = None,
     diagnostic_force_critic_failure: bool = False,
+    it_ticket_id: str | None = None,
 ) -> dict:
     from app.services.multi_agent.durable_executor import run_multi_agent_durable
 
@@ -43,6 +44,7 @@ def run_multi_agent(
         max_correction_attempts=max_correction_attempts,
         replay_of_run_id=replay_of_run_id,
         diagnostic_force_critic_failure=diagnostic_force_critic_failure,
+        it_ticket_id=it_ticket_id,
     )
 
 
@@ -220,6 +222,45 @@ def list_multi_agent_runs(limit: int = 100, tenant_id: str | None = None) -> lis
     for run in runs:
         run["critic_report"] = json_loads(run.pop("critic_report_json"), {})
     return runs
+
+
+def find_multi_agent_run_by_it_ticket(
+    ticket_id: str, tenant_id: str | None = None
+) -> dict | None:
+    """The multi-agent run opened for an IT ticket, newest first.
+
+    ``multi_agent_runs.it_ticket_id`` was added in Phase 2 to link a run back to
+    the ticket that started it, but nothing read it until the ticket chain view
+    needed to find the run behind a ticket it was handed. Ordering by
+    ``created_at DESC, id DESC`` mirrors ``list_multi_agent_runs``, so a ticket
+    resolved more than once (re-opened, re-resolved) surfaces the current run
+    rather than the first one.
+    """
+    with get_connection() as conn:
+        if tenant_id:
+            row = conn.execute(
+                """
+                SELECT * FROM multi_agent_runs
+                WHERE it_ticket_id = ? AND tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (ticket_id, tenant_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT * FROM multi_agent_runs
+                WHERE it_ticket_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (ticket_id,),
+            ).fetchone()
+    run = row_to_dict(row)
+    if not run:
+        return None
+    return run
 
 
 def get_multi_agent_run(run_id: str) -> dict | None:

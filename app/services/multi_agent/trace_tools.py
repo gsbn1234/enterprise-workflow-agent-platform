@@ -204,6 +204,10 @@ def replay_multi_agent_run(source_run_id: str) -> dict:
         enable_self_correction=True,
         max_correction_attempts=max(1, int(source.get("correction_count") or 0)),
         replay_of_run_id=source_run_id,
+        # Without this, an IT run would replay in non-IT mode and produce a
+        # structurally different trace — a silently misleading baseline, which
+        # is worse than no replay at all.
+        it_ticket_id=source.get("it_ticket_id"),
     )
     source_workflow = get_run_detail(source["workflow_run_id"]) if source.get("workflow_run_id") else None
     if replay.get("status") == "waiting_approval" and (source_workflow or {}).get("status") != "waiting_approval":

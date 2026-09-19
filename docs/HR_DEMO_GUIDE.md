@@ -4,41 +4,49 @@
 
 ## 1. 环境组成
 
-完整版 HR Demo 包含 5 个服务：
+完整版 HR Demo 由 `docker-compose.prod.yml` 定义，共 11 个服务：
 
 | 服务 | 默认地址 | 作用 |
 | --- | --- | --- |
-| Agent 用户端/后台端 | `http://127.0.0.1:8010` | 业务请求、审批、trace、workflow、审计 |
-| 外部工单系统 | `http://127.0.0.1:8020` | 模拟 Jira/Zendesk/内部工单系统 |
-| RAG 知识库 | `http://127.0.0.1:8000` | 企业知识库问答、文档检索、引用依据 |
-| PostgreSQL + pgvector | `127.0.0.1:5432` | RAG 业务库和向量库 |
-| Agent Worker | 无网页端口 | 异步队列任务执行 |
+| Agent 用户端/后台端（`workflow-agent`） | `http://127.0.0.1:8010` | 业务请求、审批、trace、workflow、审计、IT 服务面板 |
+| Agent Worker（`workflow-worker`） | 无网页端口 | 从 Redis 队列领取并执行异步任务 |
+| Outbox 派发（`workflow-outbox-dispatcher`） | 无网页端口 | 把 outbox 事件派发到外部系统 |
+| 数据保留清理（`workflow-retention-worker`） | 无网页端口 | 按保留策略定期清理审计、邮件、日志等数据 |
+| 迁移与初始化（`workflow-migrate`） | 无网页端口 | 一次性执行 schema 迁移与 demo 数据 seed，跑完即退出 |
+| Agent PostgreSQL（`agent-postgres`） | `127.0.0.1:5433` | Agent 业务主库 |
+| Redis（`agent-redis`） | `127.0.0.1:6379` | 异步任务队列信号 |
+| 外部工单系统（`external-ticket-service`） | `http://127.0.0.1:8020` | 模拟 Jira/Zendesk/内部工单系统 |
+| 本地 OIDC Provider（`local-oidc-provider`） | `http://127.0.0.1:8030` | 演示用 OIDC 登录与 JWKS |
+| RAG 知识库（`rag-app`） | `http://127.0.0.1:8000` | 企业知识库问答、文档检索、引用依据 |
+| PostgreSQL + pgvector（`rag-postgres`） | `127.0.0.1:5432` | RAG 业务库和向量库 |
 
 ## 2. 目录要求
 
-保持两个项目在同一个父目录下：
+完整版 HR Demo 需要 RAG 项目和 Agent 项目并列放置。本仓库就是 Agent 项目，它的父目录下需要有一个同级的 RAG 项目目录：
 
 ```text
-F:\VScode-project\
-  企业业务流程自动化 Agent 平台\
-  企业知识库 RAG 系统\
+<parent>\
+  enterprise-workflow-agent-platform\   ← 本仓库（Agent 平台）
+  enterprise-knowledge-rag\             ← RAG 知识库项目
 ```
 
-`docker-compose.prod.yml` 在 Agent 项目中，会通过相对路径构建 RAG 项目：
+`docker-compose.prod.yml` 中 `rag-app` 的构建上下文默认就是这个相对路径：
 
 ```text
-../企业知识库 RAG 系统
+../enterprise-knowledge-rag
+```
+
+如果你的 RAG 目录名不同，用 `RAG_BUILD_CONTEXT` 覆盖：
+
+```powershell
+$env:RAG_BUILD_CONTEXT="..\你的RAG项目目录"
 ```
 
 如果你在云服务器上部署，也建议保持同样的并列目录结构。
 
 ## 3. 本地或云服务器启动
 
-进入 Agent 项目目录：
-
-```powershell
-cd "F:\VScode-project\企业业务流程自动化 Agent 平台"
-```
+在 Agent 项目（本仓库）根目录执行下面的命令：
 
 复制 HR Demo 环境变量模板：
 
@@ -127,6 +135,9 @@ Agent 平台账号：
 | IT 权限审批 | `it_manager` | `ManagerPass123` | 审批权限申请 |
 | 采购审批 | `procurement_manager` | `ManagerPass123` | 审批采购流程 |
 | 故障审批 | `sre_manager` | `ManagerPass123` | 审批 P1/P0 故障流程 |
+| IT 支持 | `E001` | `E001Pass123` | IT 服务面板：提交 IT 请求、查看处理链路（角色 `it_support`） |
+
+`E001` 属于 IT demo 数据（`app/services/it/mock_data.py`），随 IT 目录数据一起 seed，和上面的 HR 演示账号来源不同。
 
 RAG 知识库默认关闭强鉴权，HR 可以直接查看问答页。Agent 调用 RAG 不需要 HR 单独登录。
 
@@ -268,6 +279,14 @@ EXT-000004
 
 这一步证明：Agent 能查询和修改业务对象，不只是创建工单。
 
+### 6.7 IT 服务闭环（入口指针）
+
+完整的 IT 演示流程由 `docs/AGENT_DEMO_PLAYBOOK.md` 承载，这里只列入口：
+
+- 入口在用户端的「IT 服务」面板，提交后由前端调用 `POST /api/it/requests`；请求体字段是 `objective`（不是 `text`）。
+- 链路读回用 `GET /api/it/requests/{ticket_id}/chain`，一次返回 `triage`、`resolution`、`risk_decision`、`execution`、`history`、`approval`、`events` 和 `audit`，不用重放 run。
+- 演示账号：`E001 / E001Pass123`，角色 `it_support`。
+
 ## 7. 后台重点展示区域
 
 后台端重点展示：
@@ -323,6 +342,7 @@ SMTP_USE_TLS=true
 
 普通用户账号：alice / AlicePass123
 后台管理员：admin / AdminPass123
+IT 服务演示账号：E001 / E001Pass123
 
 建议试用顺序：
 1. 用 alice 在用户端提交“远程办公”，看低风险自动完成。
@@ -330,6 +350,7 @@ SMTP_USE_TLS=true
 3. 用 admin 在后台审批，通过后看外部工单和邮件记录。
 4. 提交“安全事件”，看危险动作被阻止和审计保留。
 5. 尝试“查询工单”和“修改工单”，看自然语言操作业务对象。
+6. 用 E001 打开「IT 服务」面板提交一个 IT 请求，看链路与风险门禁。
 ```
 
 ## 10. 安全注意事项

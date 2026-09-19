@@ -10,6 +10,12 @@ from app.services.agent.retry import RetryPolicy, classify_error, default_retry_
 from app.services.agent.state import WorkflowContext
 from app.services.agent.ticket_commands import execute_ticket_query, execute_ticket_update, parse_ticket_command
 from app.services.audit import record_audit
+from app.services.it.execution import (
+    NOT_EXECUTED_ALREADY_EXECUTED,
+    NOT_EXECUTED_TOOL_ERROR,
+    execute_it_action,
+)
+from app.services.it.risk_gate import DECISION_DENY, DECISION_REQUIRE_APPROVAL
 from app.services.llm import polish_agent_answer
 from app.services.observability import start_span
 from app.services.requests import get_business_request, update_business_request_status
@@ -37,6 +43,7 @@ def run_workflow(
     plan_override: dict | None = None,
     knowledge_override: dict | None = None,
     risk_override: dict | None = None,
+    it_action: dict | None = None,
 ) -> dict:
     started = time.perf_counter()
     run_id = new_id("run")
@@ -269,6 +276,23 @@ def run_workflow(
         )
     context.artifacts["customer"] = customer.get("customer")
 
+    # An IT action takes over the run here, before the business approval branch
+    # below: the IT ticket already exists (created by the intake path), so this
+    # run must never create a second one, and whether anything executes was
+    # already decided by the deterministic risk gate. ``it_action`` is None for
+    # every non-IT run, which is what keeps all of the above untouched.
+    if it_action:
+        return _run_it_action_branch(
+            context,
+            run_id,
+            started,
+            request_id,
+            tenant,
+            plan,
+            coordination,
+            it_action,
+        )
+
     if plan["needs_approval"]:
         proposed_ticket = _proposed_ticket_payload(plan, objective, knowledge, customer.get("customer"), run_id)
         approval_payload = {
@@ -291,7 +315,10 @@ def run_workflow(
             lambda: create_approval(
                 run_id,
                 plan.get("approval_action") or "business_action",
-                "create_ticket",
+                # The IT path names the tool it actually wants approved
+                # (``restart_service``); nothing else sets this key, so every
+                # pre-existing caller still records ``create_ticket``.
+                plan.get("approval_tool") or "create_ticket",
                 approval_payload,
                 requested_by="agent",
                 tenant_id=tenant,
@@ -1051,6 +1078,254 @@ def _get_run_row(run_id: str) -> dict | None:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM workflow_runs WHERE id = ?", (run_id,)).fetchone()
     return row_to_dict(row)
+
+
+def _run_it_action_branch(
+    context: WorkflowContext,
+    run_id: str,
+    started: float,
+    request_id: str | None,
+    tenant: str,
+    plan: dict,
+    coordination: dict,
+    it_action: dict,
+) -> dict:
+    """Carry one gate-decided IT action through to its outcome.
+
+    The gate has already run; this does not re-decide anything. It maps the
+    three possible decisions onto three run endings:
+
+    ``deny``
+        Nothing runs and the ticket is rejected. The refusal is recorded by
+        ``app.services.it.execution``, which is asked to execute and declines —
+        so even the refusals travel the one code path that knows the risk rule.
+    ``require_approval``
+        An approval row is created and the ticket parks at ``waiting_approval``;
+        the run ends ``waiting_approval``, which is what makes the graph
+        interrupt further up. Note the approval payload carries ``ticket_id``
+        and deliberately no ``proposed_ticket``, so the resume path closes out
+        this existing ticket instead of creating a second one.
+    ``auto_execute``
+        The action runs and the ticket is resolved.
+    """
+    ticket_id = str(it_action.get("ticket_id") or "")
+    action_type = str(it_action.get("action_type") or "")
+    tool_name = it_action.get("tool_name")
+    arguments = dict(it_action.get("arguments") or {})
+    decision = dict(it_action.get("risk_decision") or {})
+    requested_by = it_action.get("requested_by") or context.requester_user_id
+    gate = decision.get("decision")
+    _set_run_ticket(run_id, ticket_id)
+
+    if gate == DECISION_REQUIRE_APPROVAL:
+        approval_payload = {
+            "objective": context.objective,
+            "plan": plan,
+            "ticket_id": ticket_id,
+            "it_action": {key: value for key, value in it_action.items() if key != "resolution"},
+            "it_resolution": it_action.get("resolution") or {},
+            "it_risk_decision": decision,
+            "knowledge": (context.artifacts.get("knowledge") or {}).get("results", [])[:10],
+            "requester_user_id": context.requester_user_id,
+            "requester_department": context.requester_department,
+            "multi_agent_coordination": coordination,
+        }
+        approval = _run_step(
+            context,
+            "it_request_approval",
+            "approval",
+            "request_approval",
+            approval_payload,
+            lambda: create_approval(
+                run_id,
+                plan.get("approval_action") or action_type or "it_action",
+                plan.get("approval_tool") or tool_name or "human_handoff",
+                approval_payload,
+                requested_by="agent",
+                tenant_id=tenant,
+            ),
+            "Pause a production IT action for human approval; nothing runs until a human decides.",
+        )
+        if _has_step_error(approval) or not approval.get("id"):
+            return _fail_workflow_from_tool_error(run_id, started, request_id, plan, "request_approval", approval)
+        _run_step(
+            context,
+            "it_approval_ticket",
+            "state_update",
+            "update_ticket",
+            {"ticket_id": ticket_id, "status": "waiting_approval", "approval_id": approval.get("id")},
+            lambda: update_ticket(
+                ticket_id,
+                status="waiting_approval",
+                comment=(
+                    f"IT action {action_type} requires human approval "
+                    f"({decision.get('rule_id')}). Awaiting reviewer."
+                ),
+                approval_id=approval.get("id"),
+                agent_run_id=run_id,
+                tenant_id=tenant,
+            )
+            or {"error": f"Ticket {ticket_id} was not found."},
+            "Park the IT ticket at waiting_approval while the reviewer decides.",
+        )
+        record_audit(
+            "it.approval_requested",
+            "ticket",
+            ticket_id,
+            {
+                "approval_id": approval.get("id"),
+                "action_type": action_type,
+                "tool_name": tool_name,
+                "environment": decision.get("environment"),
+                "risk_rule_id": decision.get("rule_id"),
+                "reasons": list(decision.get("reasons") or []),
+                "workflow_run_id": run_id,
+                "multi_agent_run_id": it_action.get("multi_agent_run_id"),
+                "requested_by": requested_by,
+            },
+            actor=requested_by or "agent",
+        )
+        _complete_run(
+            run_id,
+            status="waiting_approval",
+            final_answer=_it_action_answer(
+                "waiting_approval", action_type, ticket_id, decision
+            ),
+            started=started,
+            needs_approval=True,
+        )
+        if request_id:
+            update_business_request_status(request_id, "waiting_approval", plan["category"])
+        return get_run_detail(run_id)
+
+    execution = _run_step(
+        context,
+        "it_action_execute" if gate != DECISION_DENY else "it_action_denied",
+        "it_operation",
+        tool_name,
+        {**arguments, "ticket_id": ticket_id},
+        lambda: execute_it_action(
+            ticket_id=ticket_id,
+            action_type=action_type,
+            tool_name=tool_name,
+            arguments=arguments,
+            risk_decision=decision,
+            requested_by=requested_by,
+            workflow_run_id=run_id,
+            multi_agent_run_id=it_action.get("multi_agent_run_id"),
+            # The execution this run already completed, if the correction loop
+            # routed back here. Restarting a service twice is not a retry.
+            prior_execution=it_action.get("prior_execution"),
+        ),
+        (
+            "Execute the IT action the deterministic risk gate cleared automatically."
+            if gate != DECISION_DENY
+            else "Ask the executor to run a denied IT action so the refusal is recorded against the risk rule."
+        ),
+    )
+
+    if execution.get("reason") == NOT_EXECUTED_ALREADY_EXECUTED:
+        # The correction loop brought this run back through execution and the
+        # action was short-circuited because it had already run. Nothing failed
+        # and nothing changed, so the ticket keeps the state that execution
+        # gave it — rejecting it here would report a completed action as a
+        # refusal.
+        _complete_run(
+            run_id,
+            status="completed",
+            final_answer=_it_action_answer("completed", action_type, ticket_id, decision, execution),
+            started=started,
+        )
+        if request_id:
+            update_business_request_status(request_id, "completed", plan["category"])
+        return get_run_detail(run_id)
+
+    if gate == DECISION_DENY or execution.get("executed") is not True:
+        # Denied, or cleared by the gate but un-runnable / failed. Either way
+        # nothing changed on the target, and the ticket says so.
+        _run_step(
+            context,
+            "it_action_reject_ticket",
+            "state_update",
+            "update_ticket",
+            {"ticket_id": ticket_id, "status": "rejected"},
+            lambda: update_ticket(
+                ticket_id,
+                status="rejected",
+                comment=(
+                    f"IT action {action_type} was not executed "
+                    f"({execution.get('reason') or 'unknown'})."
+                ),
+                agent_run_id=run_id,
+                tenant_id=tenant,
+            )
+            or {"error": f"Ticket {ticket_id} was not found."},
+            "Record on the ticket that no IT action ran, and why.",
+        )
+        # A refusal the gate intended (deny) ends the run cancelled; a tool that
+        # broke when it was allowed to run is a failure, and saying so is what
+        # lets the critic and the operator tell the two apart.
+        outcome = "failed" if execution.get("reason") == NOT_EXECUTED_TOOL_ERROR else "cancelled"
+        _complete_run(
+            run_id,
+            status=outcome,
+            final_answer=_it_action_answer("not_executed", action_type, ticket_id, decision, execution),
+            started=started,
+        )
+        if request_id:
+            update_business_request_status(request_id, outcome, plan["category"])
+        return get_run_detail(run_id)
+
+    _run_step(
+        context,
+        "it_action_finalize",
+        "state_update",
+        "update_ticket",
+        {"ticket_id": ticket_id, "status": "resolved"},
+        lambda: update_ticket(
+            ticket_id,
+            status="resolved",
+            comment=f"IT action {action_type} executed automatically; ticket resolved.",
+            agent_run_id=run_id,
+            tenant_id=tenant,
+        )
+        or {"error": f"Ticket {ticket_id} was not found."},
+        "Resolve the IT ticket once the cleared action has run.",
+    )
+    _complete_run(
+        run_id,
+        status="completed",
+        final_answer=_it_action_answer("completed", action_type, ticket_id, decision, execution),
+        started=started,
+    )
+    if request_id:
+        update_business_request_status(request_id, "completed", plan["category"])
+    return get_run_detail(run_id)
+
+
+def _it_action_answer(
+    outcome: str,
+    action_type: str,
+    ticket_id: str,
+    decision: dict,
+    execution: dict | None = None,
+) -> str:
+    """The human-readable run answer. States what ran and what did not."""
+    rule = decision.get("rule_id") or "unknown_rule"
+    if outcome == "waiting_approval":
+        return (
+            f"IT 动作 {action_type or '-'} 需要人工审批（风险规则：{rule}），"
+            f"工单 {ticket_id} 已进入等待审批；在审批通过前不会执行任何操作。"
+        )
+    if outcome == "not_executed":
+        reason = (execution or {}).get("reason") or decision.get("decision")
+        return (
+            f"IT 动作 {action_type or '-'} 未执行（原因：{reason}；风险规则：{rule}），"
+            f"工单 {ticket_id} 已标记为 rejected，目标资产未被改动。"
+        )
+    return (
+        f"IT 动作 {action_type or '-'} 已自动执行（风险规则：{rule}），工单 {ticket_id} 已 resolved。"
+    )
 
 
 def _requires_customer_context(plan: dict, objective: str) -> bool:

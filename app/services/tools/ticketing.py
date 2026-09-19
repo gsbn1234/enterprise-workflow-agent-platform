@@ -55,6 +55,12 @@ def create_ticket(
     agent_run_id: str | None = None,
     approval_id: str | None = None,
     tenant_id: str | None = None,
+    requester_user_id: str | None = None,
+    it_category: str | None = None,
+    service: str | None = None,
+    asset_id: str | None = None,
+    environment: str | None = None,
+    triage: dict | None = None,
 ) -> dict:
     provider = _ticket_provider()
     tenant = effective_tenant_id(tenant_id)
@@ -158,8 +164,10 @@ def create_ticket(
             """
             INSERT INTO tickets
             (id, title, description, customer_id, status, priority, owner_department, tenant_id, provider,
-             external_id, external_url, idempotency_key, external_payload_json, due_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             external_id, external_url, idempotency_key, external_payload_json, due_at,
+             requester_user_id, it_category, service, asset_id, environment, triage_json,
+             created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ticket_id,
@@ -175,6 +183,12 @@ def create_ticket(
                 idempotency_key,
                 json_dumps(external["payload"]),
                 due_at,
+                requester_user_id,
+                it_category,
+                service,
+                asset_id,
+                environment,
+                json_dumps(triage or {}),
                 now,
                 now,
             ),
@@ -586,6 +600,8 @@ def _hydrate_ticket(ticket: dict | None) -> dict | None:
     if ticket and ticket.get("external_payload_json"):
         ticket["external_payload"] = json_loads(ticket.pop("external_payload_json"), {})
     if ticket:
+        if ticket.get("triage_json"):
+            ticket["triage"] = json_loads(ticket.pop("triage_json"), {})
         ticket["sla"] = ticket_sla_state(ticket)
     return ticket
 

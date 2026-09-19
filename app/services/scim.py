@@ -5,6 +5,7 @@ from typing import Any
 
 from app.config import settings
 from app.services.auth import get_user, list_users, public_user, set_user_disabled, upsert_external_user
+from app.services.it.rbac import KNOWN_ROLES
 
 
 SCIM_USER_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:User"
@@ -168,12 +169,23 @@ def _upsert_from_payload(payload: dict[str, Any], *, user_id: str) -> dict[str, 
 
 
 def _role_from_payload(payload: dict[str, Any], agent_extension: dict[str, Any]) -> str:
+    """Resolve the agent role from a SCIM payload.
+
+    ``role`` and the namespaced agent extension exist only to carry our role, so
+    an unrecognised value there is rejected — silently downgrading it to
+    ``employee`` would hide an identity-provider misconfiguration. Values inside
+    the standard ``roles`` list are treated as advisory instead: they routinely
+    carry job functions ("Contractor", "Intern") that are not access roles, so
+    unknown entries are skipped rather than fatal.
+    """
     raw_role = str(agent_extension.get("role") or payload.get("role") or "").strip().lower()
-    if raw_role in {"admin", "manager", "employee"}:
-        return raw_role
+    if raw_role:
+        if raw_role in KNOWN_ROLES:
+            return raw_role
+        raise ValueError(f"Unknown SCIM role: {raw_role!r}.")
     for item in payload.get("roles") or []:
         value = str((item or {}).get("value") or "").strip().lower()
-        if value in {"admin", "manager", "employee"}:
+        if value in KNOWN_ROLES:
             return value
     return "employee"
 

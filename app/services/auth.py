@@ -12,6 +12,7 @@ from typing import Any
 from app.config import settings
 from app.db import get_connection, row_to_dict, rows_to_dicts
 from app.services.audit import record_audit
+from app.services.it.rbac import normalize_role
 from app.services.tenancy import effective_tenant_id
 from app.utils import new_id, utc_now
 
@@ -84,7 +85,12 @@ def upsert_external_user(
 ) -> dict:
     now = utc_now()
     tenant = effective_tenant_id(tenant_id)
-    normalized_role = role if role in {"admin", "manager", "employee"} else "employee"
+    # Fail closed: an externally asserted role we do not recognise is rejected
+    # rather than silently downgraded to ``employee``. A silent downgrade hides
+    # a misconfigured identity provider behind a user that looks fine.
+    normalized_role = normalize_role(role)
+    if normalized_role is None:
+        raise ValueError(f"Unknown role for external user {user_id!r}: {role!r}.")
     with get_connection() as conn:
         conn.execute(
             """

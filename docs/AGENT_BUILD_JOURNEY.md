@@ -237,14 +237,25 @@ POST /api/jobs/{job_id}/retry
 POST /api/jobs/run-next
 ```
 
-当前使用 SQLite job table 降低部署门槛。生产化可以替换为：
+当前实现分两种后端，配置项是 `AGENT_QUEUE_BACKEND`（见 `app/services/queue.py` 和 `docs/QUEUEING.md`）：
 
 ```text
-Redis + Celery/RQ
+db     本地默认。worker 轮询 workflow_jobs 表，用数据库锁原子领取任务。
+redis  生产默认（docker-compose.prod.yml）。job 创建或重试时把 job id 推到 Redis 队列，
+       worker 阻塞弹出信号后再回到数据库领取对应行，数据库始终是 source of truth。
+```
+
+也就是说 “Redis + Celery/RQ” 里的 Redis 部分已经落地：Redis 负责唤醒与横向扩展，durable 状态仍在 `workflow_jobs` 表里。
+
+仍然保留为后续可选项的是：
+
+```text
+Celery / RQ
 PostgreSQL advisory lock
 Temporal / Prefect
-LangGraph durable execution
 ```
+
+另外，多智能体编排这一层已经接入 LangGraph durable execution（`app/services/multi_agent/durable_executor.py`），主库也已经支持 PostgreSQL。
 
 ## 7. 第六阶段：工具级 Retry / Backoff
 
@@ -571,11 +582,19 @@ python scripts\trace_replay.py diff --run-id ma_new --golden-id golden_xxx
 
 ## 13. 第十二阶段：管理台升级
 
-前端位于：
+前端源码位于：
 
 ```text
-app/static/
+frontend/
 ```
+
+这是 Vite + React 应用，构建产物输出到：
+
+```text
+app/static/react/
+```
+
+对应 `vite.config.js` 的 `root: "frontend"`、`outDir: "../app/static/react"`、`base: "/static/react/"`。服务端 `_frontend_entry()` 优先返回 `app/static/react/index.html`，只有构建产物不存在时才回退到旧的 `app/static/index.html`。
 
 当前管理台支持：
 
@@ -625,17 +644,43 @@ critic findings
 
 ## 15. 后续生产化路线
 
-建议后续按这个顺序继续：
+这份路线最初写下的 9 项里，有 4 项已经落地，因此从"后续"移到这里记录当前实现位置：
+
+```text
+已完成：
+5. OpenTelemetry
+   app/services/observability.py 的 configure_opentelemetry()，
+   AGENT_OTEL_ENABLED / OTEL_EXPORTER_OTLP_ENDPOINT / AGENT_OTEL_EXPORT_CONSOLE，
+   烟测 scripts/observability_smoke_test.py。
+   （Langfuse / LangSmith 仍未接入。）
+
+6. PostgreSQL（Alembic 未使用）
+   AGENT_DB_BACKEND=postgres + app/db.py 的 PostgresConnection，
+   schema 迁移由 scripts/migrate.py 与 schema_migrations 表管理，
+   烟测 scripts/postgres_smoke_test.py、scripts/postgres_rls_smoke_test.py。
+
+7. Redis 队列（Celery/RQ 未使用）
+   app/services/queue.py + AGENT_QUEUE_BACKEND=redis / AGENT_REDIS_URL，
+   生产 compose 默认开启，见 docs/QUEUEING.md 与 scripts/queue_smoke_test.py。
+
+8. 多租户与工具权限
+   多租户：app/services/tenancy.py、AGENT_TENANT_ISOLATION_ENABLED、
+   PostgreSQL 行级安全（app/db.py 的 postgres_rls_status）。
+   工具权限：app/services/tools/registry.py 的 required_role 与
+   app/services/it/rbac.py 的分级校验，烟测 scripts/tenant_isolation_smoke_test.py、
+   scripts/it_rbac_smoke_test.py。
+```
+
+仍然待做：
 
 ```text
 1. LangGraph 并行分支：RAG Research 与 Memory Retrieve 并行执行
+   （注：research_dispatch -> enterprise_rag_research / local_policy_research 与
+   risk_dispatch -> compliance_risk / operational_risk 已经是并行分支，
+   memory_retrieve 目前仍在 supervisor 之前串行执行。）
 2. Checkpoint fork：从指定 checkpoint 派生新 run
 3. Golden trace 可视化 diff 页面
 4. LLM-as-judge adapter
-5. OpenTelemetry + Langfuse/LangSmith
-6. PostgreSQL + Alembic
-7. Redis/Celery 或 RQ
-8. 多租户与工具权限
 9. 官方 MCP SDK
 ```
 
